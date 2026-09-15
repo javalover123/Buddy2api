@@ -211,6 +211,35 @@ def _configured_reasoning_default(model: str) -> str | None:
     return value if value in _VALID_REASONING_DEFAULTS else None
 
 
+# 上游要求第一条消息必须是 system prompt，否则返回
+# {"code":11128,"msg":"first message is not system prompt"}。
+# 客户端（如 pi 的标题生成请求）不一定带 system，缺失时这里补一条。
+# 用 CB_GATEWAY_SYSTEM_PROMPT 覆盖文案；设为 off/none/false/0 可关闭注入。
+_DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+_SYSTEM_PROMPT_DISABLED = {"off", "none", "false", "0", ""}
+
+
+def _fallback_system_prompt() -> str:
+    value = os.environ.get("CB_GATEWAY_SYSTEM_PROMPT")
+    if value is None:
+        return _DEFAULT_SYSTEM_PROMPT
+    value = value.strip()
+    return "" if value.lower() in _SYSTEM_PROMPT_DISABLED else value
+
+
+def _ensure_leading_system_message(messages):
+    """保证首条消息是 system；上游不接受首条非 system 的请求。"""
+    if not isinstance(messages, list) or not messages:
+        return messages
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") == "system":
+        return messages
+    prompt = _fallback_system_prompt()
+    if not prompt:
+        return messages
+    return [{"role": "system", "content": prompt}, *messages]
+
+
 def build_backend_body(payload: dict) -> dict:
     reasoning_control = resolve_reasoning_control(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
@@ -225,6 +254,8 @@ def build_backend_body(payload: dict) -> dict:
             else message
             for message in messages
         ]
+        # 角色归一化之后再补 system，避免 developer 被映射成 system 时重复插入
+        body["messages"] = _ensure_leading_system_message(body["messages"])
     # Resolve model alias before forwarding
     raw_model = body.get("model", "auto")
     body["model"] = resolve_model_alias(raw_model)
