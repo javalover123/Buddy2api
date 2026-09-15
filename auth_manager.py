@@ -130,6 +130,25 @@ def _mask_value(value: str, left: int = 6, right: int = 4) -> str:
     return f"{value[:left]}...{value[-right:]}"
 
 
+def _safe_is_dir(path: Path) -> bool:
+    """is_dir() 在权限不足时会抛 OSError（如 macOS 受保护目录），降级为 False。"""
+    return _dir_state(path) == "dir"
+
+
+def _dir_state(path: Path) -> str:
+    """返回 'dir' / 'unreadable' / 'missing'。
+
+    is_dir() 抛 PermissionError(EPERM) 时说明路径存在、只是读不了（不存在会是 ENOENT），
+    因此单独区分出来，避免在权限受限时误报成「目录不存在」。
+    """
+    try:
+        return "dir" if path.is_dir() else "missing"
+    except PermissionError:
+        return "unreadable"
+    except OSError:
+        return "missing"
+
+
 def candidate_auth_dirs(auth_dir: Optional[str] = None) -> list[Path]:
     """返回会被扫描的 auth 目录候选项，包括不存在的路径。"""
     custom = _expand_auth_path(auth_dir)
@@ -157,14 +176,19 @@ def candidate_auth_dirs(auth_dir: Optional[str] = None) -> list[Path]:
 
 def scan_auth_dirs(auth_dir: Optional[str] = None) -> list[Path]:
     """返回所有存在的 auth 目录路径。"""
-    return [d for d in candidate_auth_dirs(auth_dir) if d.is_dir()]
+    return [d for d in candidate_auth_dirs(auth_dir) if _safe_is_dir(d)]
 
 
 def find_auth_files(auth_dir: Optional[str] = None) -> list[Path]:
     """扫描所有 auth 目录下的 *.info 文件。"""
     custom = _expand_auth_path(auth_dir)
-    if custom and custom.is_file():
-        return [custom] if custom.suffix.lower() == ".info" else []
+    if custom:
+        try:
+            is_file = custom.is_file()
+        except OSError:
+            is_file = False
+        if is_file:
+            return [custom] if custom.suffix.lower() == ".info" else []
 
     files = []
     for d in scan_auth_dirs(auth_dir):
@@ -230,7 +254,7 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
 def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
     """返回本机 auth 文件的安全元信息，不返回任何 token 内容。"""
     candidates = candidate_auth_dirs(auth_dir)
-    existing_dirs = [d for d in candidates if d.is_dir()]
+    existing_dirs = [d for d in candidates if _safe_is_dir(d)]
     visible_dirs = existing_dirs or candidates
     in_container = _running_in_container()
     auth_mount = Path(os.environ.get("CB_CONTAINER_AUTH_DIR", "/auth"))
@@ -238,17 +262,25 @@ def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
     dirs = []
     for d in visible_dirs:
         info_files = []
-        exists = d.is_dir()
-        if exists:
+        state = _dir_state(d)
+        # 'unreadable' 表示路径存在但读不了（如 macOS 受保护目录）：
+        # 仍报 exists=True 并标记 readable=False，避免整个发现流程抛 500。
+        exists = state != "missing"
+        readable = state == "dir"
+        if readable:
             try:
                 info_files = sorted(d.glob("*.info"))
             except OSError:
                 info_files = []
-        dirs.append({
+                readable = False
+        entry = {
             "path": str(d),
             "exists": exists,
             "file_count": len(info_files),
-        })
+        }
+        if exists and not readable:
+            entry["readable"] = False
+        dirs.append(entry)
 
     existing_uids = {a.get("uid", "") for a in db.list_accounts() if a.get("uid")}
     files = [_safe_auth_file_meta(f, existing_uids) for f in find_auth_files(auth_dir)]
