@@ -14,6 +14,8 @@ import asyncio
 import json
 import os
 import time
+import uuid
+from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 import httpx
@@ -254,6 +256,49 @@ def _ensure_leading_system_message(messages):
     return [{"role": "system", "content": prompt}, *messages]
 
 
+# 上游在 thinking 模式下要求历史里的 assistant 消息回传 reasoning_content，否则返回
+# {"code":11155,"msg":"the reasoning content from the previous turn must be
+# passed back in thinking mode"}。
+# 客户端（pi / opencode / DSH 等）在跨模型续聊时会把上一轮的 reasoning 降级成普通
+# 文本，导致该字段整体缺失；缺失时这里补一个空串占位。
+# 用 CB_GATEWAY_REASONING_PASSTHROUGH=off 可关闭。
+_DISABLED_VALUES = {"off", "none", "false", "0", ""}
+
+
+def _reasoning_passthrough_enabled() -> bool:
+    value = os.environ.get("CB_GATEWAY_REASONING_PASSTHROUGH")
+    if value is None:
+        return True
+    return value.strip().lower() not in _DISABLED_VALUES
+
+
+def _thinking_mode_enabled(reasoning_effort) -> bool:
+    """判断本次请求是否真的处于思考模式。"""
+    if not reasoning_effort:
+        return False
+    return str(reasoning_effort).strip().lower() not in {"none", "off", "disabled"}
+
+
+def _ensure_reasoning_content_on_assistant_messages(messages, thinking_enabled: bool):
+    """thinking 模式下为缺失 reasoning_content 的 assistant 消息补空串占位。"""
+    if not thinking_enabled or not _reasoning_passthrough_enabled():
+        return messages
+    if not isinstance(messages, list):
+        return messages
+    patched: list = []
+    changed = False
+    for message in messages:
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and "reasoning_content" not in message
+        ):
+            message = {**message, "reasoning_content": ""}
+            changed = True
+        patched.append(message)
+    return patched if changed else messages
+
+
 def build_backend_body(payload: dict) -> dict:
     reasoning_control = resolve_reasoning_control(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
@@ -285,6 +330,13 @@ def build_backend_body(payload: dict) -> dict:
             reasoning_effort = chat_reasoning_effort(reasoning_control)
         if reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
+    # 思考模式下上游要求回传 reasoning_content，缺失会导致 11155。
+    # 放在这里是因为此时 reasoning_effort 才最终确定。
+    if isinstance(body.get("messages"), list):
+        body["messages"] = _ensure_reasoning_content_on_assistant_messages(
+            body["messages"],
+            _thinking_mode_enabled(body.get("reasoning_effort")),
+        )
     body["stream"] = True
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
@@ -296,6 +348,66 @@ def get_all_aliases() -> dict:
     import aliases
 
     return aliases.merged_map("workbuddy")
+
+
+_DEBUG_REJECT_DIR = os.environ.get("CB_GATEWAY_DEBUG_REJECT_DIR", "").strip()
+_DEBUG_REJECT_KEEP = 20
+
+
+def _dump_rejected_request(body: dict, status: int, raw_error: bytes) -> None:
+    """上游返回 4xx 时把请求体落盘，便于定位协议类报错（如 11155）。
+
+    默认写入 <项目目录>/debug_rejects，最多保留最近 20 份；
+    用 CB_GATEWAY_DEBUG_REJECT_DIR=off 可关闭。
+    """
+    if status < 400 or status >= 500:
+        return
+    target = _DEBUG_REJECT_DIR or str(Path(__file__).parent / "debug_rejects")
+    if target.strip().lower() in _DISABLED_VALUES:
+        return
+    try:
+        directory = Path(target)
+        directory.mkdir(parents=True, exist_ok=True)
+        messages = body.get("messages")
+        summary = (
+            [
+                {
+                    "role": message.get("role"),
+                    "has_reasoning_content": "reasoning_content" in message,
+                    "tool_calls": len(message.get("tool_calls") or []),
+                }
+                for message in messages
+                if isinstance(message, dict)
+            ]
+            if isinstance(messages, list)
+            else []
+        )
+        token = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        path = directory / f"reject-{status}-{token}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "status": status,
+                    "error": raw_error.decode("utf-8", "replace")[:2000],
+                    "model": body.get("model"),
+                    "reasoning_effort": body.get("reasoning_effort"),
+                    "messages_summary": summary,
+                    "body": body,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        stale = sorted(directory.glob("reject-*.json"))
+        for old in stale[:-_DEBUG_REJECT_KEEP]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        print(f"[debug] 上游拒绝的请求已保存: {path}")
+    except Exception as exc:  # 诊断辅助不应影响主流程
+        print(f"[debug] 保存被拒请求失败: {exc}")
 
 
 def _safe_err(raw: bytes, status: int) -> dict:
@@ -1006,6 +1118,7 @@ async def _stream_upstream(
                 async with client.stream("POST", url, headers=headers, json=body) as response:
                     if response.status_code != 200:
                         raw_error = await response.aread()
+                        _dump_rejected_request(body, response.status_code, raw_error)
                         last_error = raw_error
                         last_error_event = None
                         last_status = response.status_code

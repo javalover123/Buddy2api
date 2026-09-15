@@ -102,6 +102,112 @@ def test_build_backend_body_maps_developer_messages_to_system(monkeypatch):
     assert messages[0]["role"] == "developer"
 
 
+def test_build_backend_body_fills_missing_reasoning_content_in_thinking_mode(monkeypatch):
+    """thinking 模式下 assistant 缺 reasoning_content 会导致上游 11155，需补空串占位。"""
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = proxy.build_backend_body({
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "call_1", "type": "function",
+                             "function": {"name": "bash", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ],
+    })
+
+    assistant = body["messages"][-2]
+    assert assistant["reasoning_content"] == ""
+    assert body["messages"][0]["role"] == "system"
+    assert "reasoning_content" not in body["messages"][-1]
+
+
+def test_build_backend_body_preserves_existing_reasoning_content(monkeypatch):
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = proxy.build_backend_body({
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {"role": "assistant", "content": "hi", "reasoning_content": "real reasoning"},
+        ],
+    })
+
+    assert body["messages"][-1]["reasoning_content"] == "real reasoning"
+
+
+@pytest.mark.parametrize(
+    ("payload", "model"),
+    [
+        ({"reasoning_effort": "none"}, "deepseek-v4-pro"),
+        ({}, "glm-5.2"),
+    ],
+)
+def test_build_backend_body_skips_reasoning_fill_when_thinking_disabled(
+    monkeypatch,
+    payload,
+    model,
+):
+    """未开启思考模式时不应注入 reasoning_content，避免污染普通请求。"""
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda value: value)
+
+    body = proxy.build_backend_body({
+        "model": model,
+        "messages": [{"role": "assistant", "content": "hi"}],
+        **payload,
+    })
+
+    assert "reasoning_effort" not in body
+    assert "reasoning_content" not in body["messages"][-1]
+
+
+def test_build_backend_body_reasoning_fill_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("CB_GATEWAY_REASONING_PASSTHROUGH", "off")
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = proxy.build_backend_body({
+        "model": "deepseek-v4-pro",
+        "messages": [{"role": "assistant", "content": "hi"}],
+    })
+
+    assert body["reasoning_effort"] == "high"
+    assert "reasoning_content" not in body["messages"][-1]
+
+
+def test_dump_rejected_request_writes_body_and_prunes(monkeypatch, tmp_path):
+    monkeypatch.setattr(proxy, "_DEBUG_REJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(proxy, "_DEBUG_REJECT_KEEP", 3)
+
+    body = {
+        "model": "deepseek-v4-pro",
+        "reasoning_effort": "high",
+        "messages": [{"role": "assistant", "content": "hi"}],
+    }
+    for _ in range(5):
+        proxy._dump_rejected_request(body, 400, b'{"code":11155}')
+
+    files = sorted(tmp_path.glob("reject-*.json"))
+    assert len(files) == 3
+    dumped = json.loads(files[-1].read_text(encoding="utf-8"))
+    assert dumped["status"] == 400
+    assert "11155" in dumped["error"]
+    assert dumped["messages_summary"] == [
+        {"role": "assistant", "has_reasoning_content": False, "tool_calls": 0}
+    ]
+
+
+def test_dump_rejected_request_ignores_success_and_server_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr(proxy, "_DEBUG_REJECT_DIR", str(tmp_path))
+
+    proxy._dump_rejected_request({"messages": []}, 200, b"ok")
+    proxy._dump_rejected_request({"messages": []}, 502, b"bad gateway")
+
+    assert list(tmp_path.glob("reject-*.json")) == []
+
+
 def test_audit_detector_requires_a_short_refusal_response():
     refusal = "系统检测到您当前输入的信息存在敏感内容，无法响应您的请求，请检查后重新输入。"
     quoted_in_normal_answer = (

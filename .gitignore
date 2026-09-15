@@ -85,3 +85,7 @@ desktop.ini
 
 # Ant Code composer uploads
 ant-code-uploads/
+
+# 本地诊断产物（上游 4xx 请求快照）与 pytest 临时目录
+debug_rejects/
+.pytest_tmp/
