@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -206,6 +207,36 @@ def test_dump_rejected_request_ignores_success_and_server_errors(monkeypatch, tm
     proxy._dump_rejected_request({"messages": []}, 502, b"bad gateway")
 
     assert list(tmp_path.glob("reject-*.json")) == []
+
+
+def test_configure_outbound_proxy_defaults_to_direct(monkeypatch):
+    """默认丢弃继承来的代理：长驻进程里的会话级端口失效后会导致上游全部 ConnectError。"""
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:65256")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:65256")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:65256")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:65256")
+    monkeypatch.delenv("CB_GATEWAY_UPSTREAM_PROXY", raising=False)
+
+    described = server._configure_outbound_proxy()
+
+    assert described.startswith("direct")
+    for name in server._OUTBOUND_PROXY_VARS:
+        assert os.environ.get(name) is None
+    assert os.environ["NO_PROXY"] == "*"
+    assert os.environ["no_proxy"] == "*"
+
+
+def test_configure_outbound_proxy_honours_explicit_setting(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:65256")
+    monkeypatch.setenv("CB_GATEWAY_UPSTREAM_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("NO_PROXY", "example.com")
+
+    described = server._configure_outbound_proxy()
+
+    assert described == "explicit (http://127.0.0.1:7890)"
+    for name in server._OUTBOUND_PROXY_VARS:
+        assert os.environ[name] == "http://127.0.0.1:7890"
+    assert os.environ.get("NO_PROXY") is None
 
 
 def test_audit_detector_requires_a_short_refusal_response():

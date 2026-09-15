@@ -72,6 +72,37 @@ def _cors_origins() -> list[str]:
     return [origin.strip() for origin in value.split(",") if origin.strip()]
 
 
+_OUTBOUND_PROXY_VARS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+)
+
+
+def _configure_outbound_proxy() -> str:
+    """规范出站代理设置，返回给启动横幅用的描述。
+
+    网关是长驻进程，而本机的代理端口往往是**按会话分配**的（HTTP_PROXY 与
+    CODEBUDDY_SERVICE_PROXY_URL 都带随机端口）。启动时继承下来的端口一旦失效，
+    之后**所有**上游请求都会 ConnectError（"All connection attempts failed"），
+    而进程环境无法感知端口变化，只能一直失败。
+
+    所以默认**不使用**继承来的代理，直连上游；确实需要走代理时用
+    CB_GATEWAY_UPSTREAM_PROXY 显式指定。
+    """
+    explicit = os.environ.get("CB_GATEWAY_UPSTREAM_PROXY", "").strip()
+    if explicit:
+        for name in _OUTBOUND_PROXY_VARS:
+            os.environ[name] = explicit
+        os.environ.pop("NO_PROXY", None)
+        os.environ.pop("no_proxy", None)
+        return f"explicit ({explicit})"
+    for name in _OUTBOUND_PROXY_VARS:
+        os.environ.pop(name, None)
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+    return "direct (CB_GATEWAY_UPSTREAM_PROXY 可指定代理)"
+
+
 app = FastAPI(title="Buddy 2 API", version=VERSION)
 _CORS_ORIGINS = _cors_origins()
 
@@ -1306,6 +1337,9 @@ def main():
     if not 1 <= args.port <= 65535:
         ap.error("--port must be between 1 and 65535")
 
+    # 必须在任何出站请求之前执行：默认丢弃继承来的（会失效的）代理设置。
+    outbound_proxy = _configure_outbound_proxy()
+
     if args.no_admin_auth and args.host not in {"127.0.0.1", "localhost", "::1"}:
         ap.error("--no-admin-auth can only be used with a loopback host")
 
@@ -1366,6 +1400,7 @@ def main():
     sys.stderr.write(
         f"  启动导入: {'on' if control_plane.auto_import_enabled() else 'off (CB_GATEWAY_AUTO_IMPORT=1 可打开)'}\n"
     )
+    sys.stderr.write(f"  出站代理: {outbound_proxy}\n")
     sys.stderr.write(f"  Admin: {'local automatic access' if LOCAL_MODE else 'token required'}\n")
     if ADMIN_TOKEN:
         sys.stderr.write("  Admin Token: configured (hidden)\n")
