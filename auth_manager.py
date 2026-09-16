@@ -23,6 +23,7 @@ import httpx
 
 import database as db
 import fingerprint
+import sites
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
@@ -36,9 +37,28 @@ _lock = threading.Lock()
 _token_locks: dict[int, asyncio.Lock] = {}
 _token_locks_guard = threading.Lock()
 _route_lock = threading.Lock()
+# 键是 (provider, model) 的组合（见 _sticky_key），不是单纯的 provider：
+# 国内模型与国际模型能用的账号集不同，各留各的粘性槽才不会互相顶掉。
 _sticky_account_id: dict[str, int] = {}
 _failure_lock = threading.Lock()
 _account_failures: dict[int, tuple[int, float]] = {}
+# 连续鉴权失败计数（401/403 或刷新被拒）。只有达到阈值才会触发复核/失效，
+# 避免一次瞬时 401 就把账号永久停用。
+_auth_failure_lock = threading.Lock()
+_auth_failures: dict[int, int] = {}
+_verify_lock = threading.Lock()
+_verify_inflight: set[int] = set()
+
+# 连续 N 次鉴权失败才判定账号失效；可用 settings.auth_failure_threshold 覆盖。
+AUTH_FAILURE_THRESHOLD = 3
+
+# 站点偏好：settings.model_site_preference = {"default": <站点>, "models": {模型: <站点>}}。
+# 同一个模型在国内站与国际站的计费不同（实测 deepseek-v4.1-flash 国际站免费、国内站
+# 扣额度），所以「优先用哪边的账号」只能按模型配置，不能在选号逻辑里写死。
+# 默认不区分（空串）：没配置过的用户路由行为完全不变，不会因为引入这个设置而把某一边
+# 的账号静默降级。
+SITE_PREFERENCE_SETTING = "model_site_preference"
+SITE_PREFERENCE_DEFAULT = ""
 
 
 def _get_token_lock(aid: int) -> asyncio.Lock:
@@ -53,6 +73,20 @@ def backend_url() -> str:
     return value if value.startswith("https://") else BACKEND
 
 
+# 国内版站点后缀的判定统一在 sites.py，这里不再自带一份（历史上
+# fingerprint.origin_for 另有一套规则，导致请求发往国内站却自称国际站）。
+def backend_url_for(account: Optional[dict] = None) -> str:
+    """按账号所属站点选择上游域名，而不是一律使用全局 backend_url。
+
+    国内版与国际版的凭证互不通用：把国内版账号的凭证发到 www.workbuddy.ai，会被
+    openresty/APISIX 直接 401，随后 mark_account_failure 会把该账号误标成 expired
+    （其实它的 token 还有效）。所以 domain 指向国内站点的账号必须走它自己的站点。
+
+    只对国内后缀做特判、不动 .ai 账号，这样自定义 relay 仍然对默认站点生效。
+    """
+    return sites.site_url((account or {}).get("domain")) or backend_url()
+
+
 def request_timeout(default: int) -> int:
     try:
         return max(5, min(600, int(db.get_setting("timeout", default))))
@@ -60,9 +94,80 @@ def request_timeout(default: int) -> int:
         return default
 
 
+def auth_failure_threshold() -> int:
+    """连续多少次鉴权失败才判定账号失效。"""
+    try:
+        value = int(db.get_setting("auth_failure_threshold", AUTH_FAILURE_THRESHOLD))
+    except (TypeError, ValueError):
+        return AUTH_FAILURE_THRESHOLD
+    return max(1, min(20, value))
+
+
+def _clean_site(value) -> str:
+    """只接受 sites.SITE_GROUPS 里的值；其余（含空串）视为「不区分」。"""
+    text = str(value or "").strip().lower()
+    return text if text in sites.SITE_GROUPS else ""
+
+
+def model_site_preference() -> dict:
+    """容错读取站点偏好设置，返回 {"default": str, "models": {模型: str}}。
+
+    设置缺失或格式不对时给默认值而不是报错：路由不能因为一条配置写坏就整个失效。
+    注意区分「设置不存在」与「显式留空」：不存在 → 用内置默认值，空串 → 不区分站点。
+    """
+    try:
+        raw = db.get_setting(SITE_PREFERENCE_SETTING, None)
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        return {"default": SITE_PREFERENCE_DEFAULT, "models": {}}
+
+    models = raw.get("models")
+    clean: dict[str, str] = {}
+    if isinstance(models, dict):
+        for key, value in models.items():
+            model = str(key or "").strip()
+            if model:
+                clean[model] = _clean_site(value)
+
+    default = raw.get("default") if "default" in raw else SITE_PREFERENCE_DEFAULT
+    return {"default": _clean_site(default), "models": clean}
+
+
+def preferred_site_for(model: Optional[str]) -> str:
+    """该模型优先用哪一组站点的账号。返回空串表示不区分站点。
+
+    只影响优先级、不会排除账号：偏好站点没账号或都被试过时，`pick_account` 会退回
+    全部候选，不会退化成「明明有账号却报无可用账号」。
+    """
+    preference = model_site_preference()
+    mid = str(model or "").strip()
+    if mid and mid in preference["models"]:
+        return preference["models"][mid]
+    return preference["default"]
+
+
+def _bump_auth_failure(aid: int) -> int:
+    with _auth_failure_lock:
+        count = _auth_failures.get(aid, 0) + 1
+        _auth_failures[aid] = count
+        return count
+
+
+def _reset_auth_failure(aid: int):
+    with _auth_failure_lock:
+        _auth_failures.pop(aid, None)
+
+
+def auth_failure_count(aid: int) -> int:
+    with _auth_failure_lock:
+        return _auth_failures.get(aid, 0)
+
+
 def mark_account_success(aid: int):
     with _failure_lock:
         _account_failures.pop(aid, None)
+    _reset_auth_failure(aid)
 
 
 def mark_account_failure(aid: int, status_code: int = 0):
@@ -73,7 +178,107 @@ def mark_account_failure(aid: int, status_code: int = 0):
         cooldown = min(300, base * (2 ** min(count - 1, 4)))
         _account_failures[aid] = (count, time.monotonic() + cooldown)
     if status_code in {401, 403}:
+        # 401/403 常常只是一次瞬时抖动（上游边界网关抽风、账号被发到非所属站点等），
+        # 一次就置 expired 会让一个 token 还有效的账号被永久停用、只能手工恢复。
+        # 改为：先累积计数 + 冷却；达到阈值后做一次真实复核，复核确认失效才置 expired。
+        if _bump_auth_failure(aid) >= auth_failure_threshold():
+            _schedule_credentials_verification(aid)
+
+
+def _schedule_credentials_verification(aid: int):
+    """把凭证复核排进事件循环；同步上下文（无运行中的 loop）下放弃。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    with _verify_lock:
+        if aid in _verify_inflight:
+            return
+        _verify_inflight.add(aid)
+
+    async def _runner():
+        try:
+            await verify_account_credentials(aid)
+        except Exception as exc:  # 复核绝不能影响正常请求链路
+            print(f"[auth_manager] 凭证复核异常 (account={aid}): {exc}", file=sys.stderr)
+        finally:
+            with _verify_lock:
+                _verify_inflight.discard(aid)
+
+    loop.create_task(_runner())
+
+
+async def probe_account_credentials(account: dict) -> tuple[str, str]:
+    """用账号自己的站点做一次轻量真实请求，判断凭证是否真的还有效。
+
+    返回 ("ok" | "invalid" | "unknown", 说明)。只有明确被上游拒绝鉴权才返回
+    "invalid"；网络错误、5xx 等一律 "unknown"，不下结论。
+    """
+    aid = (account or {}).get("id")
+    if not account:
+        return "unknown", "account not found"
+
+    if is_token_expired(account):
+        # access token 已过期：能否刷新是唯一判据
+        if await refresh_token(account):
+            return "ok", "access token refreshed"
+        return "invalid", "token refresh rejected"
+
+    headers = build_billing_headers(_fingerprint_account(account))
+    url = f"{backend_url_for(account)}/v2/billing/meter/get-user-resource"
+    try:
+        async with httpx.AsyncClient(timeout=request_timeout(15)) as c:
+            r = await c.post(url, headers=headers, json={})
+    except httpx.HTTPError as exc:
+        return "unknown", f"network error: {str(exc)[:120]}"
+
+    if r.status_code in (401, 403):
+        return "invalid", f"HTTP {r.status_code} from {url.split('/v2/')[0]}"
+    if not (200 <= r.status_code < 300):
+        return "unknown", f"HTTP {r.status_code}"
+    try:
+        r.json()
+    except ValueError:
+        return "unknown", f"non-json body (HTTP {r.status_code})"
+    print(f"[auth_manager] 账号 {aid} 凭证复核通过（HTTP {r.status_code}）", file=sys.stderr)
+    return "ok", f"HTTP {r.status_code}"
+
+
+async def verify_account_credentials(aid: int) -> dict:
+    """鉴权失败达到阈值后的复核：只有确认凭证真的失效才把账号置为 expired。"""
+    account = db.get_account(aid)
+    if not account:
+        _reset_auth_failure(aid)
+        return {"account_id": aid, "action": "skipped", "detail": "account not found"}
+
+    status = str(account.get("status") or "")
+    if status != "active":
+        # 人工停用 / 已判定失效的账号不在这里干预
+        _reset_auth_failure(aid)
+        return {"account_id": aid, "action": "skipped", "detail": f"status={status}"}
+
+    result, detail = await probe_account_credentials(account)
+    if result == "ok":
+        _reset_auth_failure(aid)
+        print(
+            f"[auth_manager] 账号 {aid} 连续鉴权失败后复核通过（{detail}），保持 active",
+            file=sys.stderr,
+        )
+        return {"account_id": aid, "action": "kept_active", "detail": detail}
+
+    if result == "invalid":
+        _reset_auth_failure(aid)
         db.update_account(aid, {"status": "expired"})
+        print(
+            f"[auth_manager] 账号 {aid} 连续 {auth_failure_threshold()} 次鉴权失败且复核失败"
+            f"（{detail}），已置为 expired",
+            file=sys.stderr,
+        )
+        return {"account_id": aid, "action": "expired", "detail": detail}
+
+    # 上游本身有问题时不下结论，只保留冷却
+    print(f"[auth_manager] 账号 {aid} 凭证复核结果不确定（{detail}），保持 active", file=sys.stderr)
+    return {"account_id": aid, "action": "inconclusive", "detail": detail}
 
 
 def account_is_cooling_down(aid: int) -> bool:
@@ -273,13 +478,14 @@ def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
             except OSError:
                 info_files = []
                 readable = False
+        # readable 必须始终输出：前端是按 `d.readable ? ... : ...` 取值的，
+        # 字段缺失时 undefined 为假，会把正常可读的目录误标成「无权限」。
         entry = {
             "path": str(d),
             "exists": exists,
+            "readable": readable,
             "file_count": len(info_files),
         }
-        if exists and not readable:
-            entry["readable"] = False
         dirs.append(entry)
 
     existing_uids = {a.get("uid", "") for a in db.list_accounts() if a.get("uid")}
@@ -394,7 +600,7 @@ async def refresh_token(account: dict) -> bool:
     lock = _get_token_lock(aid)
     async with lock:
         headers = build_refresh_headers(account)
-        url = f"{backend_url()}/v2/plugin/auth/token/refresh"
+        url = f"{backend_url_for(account)}/v2/plugin/auth/token/refresh"
 
         try:
             async with httpx.AsyncClient(timeout=request_timeout(15)) as c:
@@ -406,9 +612,17 @@ async def refresh_token(account: dict) -> bool:
 
         if not isinstance(data, dict) or data.get("code") != 0 or not data.get("data"):
             message = data.get("msg", "upstream rejected refresh") if isinstance(data, dict) else "invalid response"
-            print(f"[auth_manager] 刷新 token 失败 (account={aid}): {str(message)[:240]}", file=sys.stderr)
-            # 标记账号为过期
-            db.update_account(aid, {"status": "expired"})
+            # 单次刷新被拒不足以判定失效（上游也可能瞬时抽风），同样累积到阈值再置 expired。
+            if _bump_auth_failure(aid) >= auth_failure_threshold():
+                _reset_auth_failure(aid)
+                db.update_account(aid, {"status": "expired"})
+                print(
+                    f"[auth_manager] 账号 {aid} 连续 {auth_failure_threshold()} 次刷新被拒，已置为 expired"
+                    f"（{str(message)[:240]}）",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[auth_manager] 刷新 token 失败 (account={aid}): {str(message)[:240]}", file=sys.stderr)
             return False
 
         new_auth = data["data"]
@@ -427,6 +641,7 @@ async def refresh_token(account: dict) -> bool:
             "status": next_status,
         }
         db.update_account(aid, update_data)
+        _reset_auth_failure(aid)
         return True
 
 
@@ -710,7 +925,7 @@ async def fetch_account_resources(
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(25)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/get-user-resource", headers=headers, json={})
+            r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/get-user-resource", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _resource_failure(
@@ -832,7 +1047,7 @@ async def fetch_checkin_status(
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(20)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
+            r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _checkin_failure(account, status_code=0, message=str(e)[:240], allow_stale=allow_stale)
@@ -886,7 +1101,7 @@ async def claim_daily_checkin(account: dict) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(30)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/daily-checkin", headers=headers, json={})
+            r = await c.post(f"{backend_url_for(fresh)}/v2/billing/meter/daily-checkin", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _checkin_result(account, ok=False, status_code=0, message=str(e)[:240])
@@ -922,8 +1137,81 @@ async def claim_daily_checkin(account: dict) -> dict:
 
 
 # ============================================================
-# 账号路由（同级粘性）
+# 账号路由（同级粘性 + 模型能力感知）
 # ============================================================
+
+# 账号级模型能力。
+#
+# 国内站与国际站暴露的模型集几乎不重叠（实测国际站 18 个、国内站 29 个，交集 3 个），
+# 而模型目录是按「通道」存的 —— 混装账号时目录必然是并集，单看目录无法判断某个账号
+# 能不能服务某个模型。于是会出现：客户端请求只在国际站存在的模型，路由却把它发给了
+# 国内账号，上游回 400（模型不存在 / 未授权），而 400 不在换号重试的集合里，客户端
+# 直接看到报错。
+#
+# 这里记住两件事：
+#   _account_models  —— 供应商模型列表说这个账号能服务哪些模型（主动能力）
+#   _account_denied  —— 实测被上游明确拒绝过的模型（被动纠正，能覆盖列表不准的情况）
+# 两者取交集的反面：被拒过 → 不能；已知列表里没有 → 不能；其余未知 → 先试，错了再记。
+_model_capability_lock = threading.Lock()
+_account_models: dict[int, frozenset[str]] = {}
+_account_denied: dict[int, set[str]] = {}
+
+
+def record_account_models(aid: int, model_ids) -> None:
+    """记录账号在自己站点上能服务的模型（来自供应商模型列表）。"""
+    ids = frozenset(str(mid).strip() for mid in (model_ids or []) if str(mid).strip())
+    if not ids:
+        return
+    with _model_capability_lock:
+        _account_models[aid] = ids
+        # 已经被拒、但新列表里也没有的模型不可能再被选中，顺手清掉避免无限增长
+        denied = _account_denied.get(aid)
+        if denied:
+            denied &= ids
+            if not denied:
+                _account_denied.pop(aid, None)
+
+
+def mark_model_denied(aid: int, model: str) -> None:
+    """记录「这个账号服务不了这个模型」——上游已经明确拒绝过。"""
+    mid = str(model or "").strip()
+    if not mid:
+        return
+    with _model_capability_lock:
+        _account_denied.setdefault(aid, set()).add(mid)
+
+
+def account_supports_model(aid: int, model: str) -> bool:
+    """账号能否服务该模型。能力未知时返回 True（先试，由 400 自愈）。"""
+    mid = str(model or "").strip()
+    if not mid:
+        return True
+    with _model_capability_lock:
+        if mid in _account_denied.get(aid, ()):
+            return False
+        known = _account_models.get(aid)
+    if known is not None and mid not in known:
+        return False
+    return True
+
+
+def forget_account(aid: int) -> None:
+    """账号被删除后清掉它的全部路由状态。
+
+    能力、粘性、失败计数都是按账号 id 存在内存里的，账号删了不清就会一直留着 ——
+    粘性槽指向一个不存在的 id 会让该槽每次都要重新挑选，能力记录则是纯泄漏。
+    """
+    with _model_capability_lock:
+        _account_models.pop(aid, None)
+        _account_denied.pop(aid, None)
+    with _route_lock:
+        for key, sticky_id in list(_sticky_account_id.items()):
+            if sticky_id == aid:
+                _sticky_account_id.pop(key, None)
+    with _failure_lock:
+        _account_failures.pop(aid, None)
+    _reset_auth_failure(aid)
+
 
 def _route_int(value, default: int = 0) -> int:
     try:
@@ -942,25 +1230,64 @@ def _route_weight(account: dict) -> int:
     return max(1, _route_int(account.get("weight"), 1))
 
 
+def _route_load(account: dict) -> float:
+    """按权重归一后的请求数，越小越空闲。"""
+    return _route_int(account.get("total_requests"), 0) / _route_weight(account)
+
+
 def _route_sort_key(account: dict):
     weight = _route_weight(account)
     total_requests = _route_int(account.get("total_requests"), 0)
     return (
         -_route_priority(account),
         -weight,
-        total_requests / weight,
+        _route_load(account),
         total_requests,
         _route_int(account.get("id"), 0),
     )
 
 
-def _set_sticky_account(aid: int, provider: str = "workbuddy"):
+# 粘性按 (通道, 模型) 分槽。不同模型能服务的账号集本来就不同（国内模型只有国内账号
+# 有），共用一个槽会互相顶掉 —— 那正是「混装账号之后所有请求都压在一个账号上」的来源。
+_STICKY_WILDCARD = "*"
+
+# 粘性容差：按权重归一后的负载允许领先多少（1.0 = 一个权重单位的请求量）。
+_STICKY_LOAD_SLACK = 1.0
+
+
+def _sticky_key(provider: str, model: Optional[str]) -> str:
+    return f"{provider}\x1f{str(model or '').strip() or _STICKY_WILDCARD}"
+
+
+def _set_sticky_account(aid: int, provider: str = "workbuddy", model: Optional[str] = None):
     with _route_lock:
-        _sticky_account_id[provider] = aid
+        _sticky_account_id[_sticky_key(provider, model)] = aid
 
 
-def pick_account(exclude_ids: set[int] = None, provider: str = "workbuddy") -> Optional[dict]:
-    """选择一个可用账号。优先级越高越先用，同优先级尽量粘住当前账号。"""
+def _sticky_overloaded(sticky: dict, chosen: dict) -> bool:
+    """粘住的账号是否已经明显比同级最空闲的账号更累。
+
+    容差是常量而不是按账号权重放大：权重只影响「多少请求算一个负载单位」，
+    若再拿权重当容差，高权重账号会被允许领先过多，均衡就失去意义了。
+    没有容差则会在两个账号之间来回抖动。
+    """
+    return _route_load(sticky) > _route_load(chosen) + _STICKY_LOAD_SLACK
+
+
+def pick_account(
+    exclude_ids: set[int] = None,
+    provider: str = "workbuddy",
+    model: Optional[str] = None,
+) -> Optional[dict]:
+    """选择一个可用账号。
+
+    优先级越高越先用；同优先级下先按「能不能服务这个模型」过滤，再按站点偏好过滤，
+    最后尽量粘住该模型上次用的账号（保住 prompt cache）。粘性只在没有明显跑偏时
+    保留：粘住的账号比同级最空闲的账号多干了不少活就让位，避免长期只压一个账号。
+
+    两道过滤都只调整优先级、不清空候选（能力过滤在有能力账号时生效，站点偏好在偏好
+    站点有账号时生效），否则会出现「明明有账号，却报 No available accounts」。
+    """
     exclude_ids = exclude_ids or set()
     accounts = db.get_active_accounts(provider)
     candidates = [
@@ -970,25 +1297,41 @@ def pick_account(exclude_ids: set[int] = None, provider: str = "workbuddy") -> O
     if not candidates:
         return None
 
+    if model:
+        capable = [a for a in candidates if account_supports_model(a["id"], model)]
+        # 已知全都不支持时保留原候选：让上游来判，顺便把结论学回来
+        if capable:
+            candidates = capable
+
+    # 站点偏好只调优先级、不排除账号：同一个模型两边计费不同，优先用不花钱的那边。
+    # 偏好那边的账号都被试过（exclude_ids）时退回全部候选，不能让请求无账号可用。
+    preferred = preferred_site_for(model) if model else ""
+    if preferred:
+        on_preferred = [a for a in candidates if sites.site_group(a.get("domain")) == preferred]
+        if on_preferred:
+            candidates = on_preferred
+
     highest_priority = max(_route_priority(a) for a in candidates)
     top_candidates = [a for a in candidates if _route_priority(a) == highest_priority]
+    chosen = sorted(top_candidates, key=_route_sort_key)[0]
+    key = _sticky_key(provider, model)
     with _route_lock:
-        sticky_id = _sticky_account_id.get(provider)
+        sticky_id = _sticky_account_id.get(key)
         if sticky_id is not None:
             sticky = next((a for a in top_candidates if a["id"] == sticky_id), None)
-            if sticky:
+            if sticky is not None and not _sticky_overloaded(sticky, chosen):
                 return sticky
-
-        chosen = sorted(top_candidates, key=_route_sort_key)[0]
-        _sticky_account_id[provider] = chosen["id"]
+        _sticky_account_id[key] = chosen["id"]
         return chosen
 
 
 async def pick_account_with_fallback(
-    exclude_ids: set[int] = None, provider: str = "workbuddy"
+    exclude_ids: set[int] = None,
+    provider: str = "workbuddy",
+    model: Optional[str] = None,
 ) -> Optional[dict]:
     """选账号，如果全部过期则尝试刷新过期账号。只刷新同一 provider。"""
-    account = pick_account(exclude_ids, provider=provider)
+    account = pick_account(exclude_ids, provider=provider, model=model)
     if account:
         return account
 
@@ -1003,10 +1346,12 @@ async def pick_account_with_fallback(
     for a in expired_accounts:
         if a["id"] in (exclude_ids or set()):
             continue
+        if model and not account_supports_model(a["id"], model):
+            continue
         if await refresh_token(a):
             fresh = db.get_account(a["id"])
             if fresh:
-                _set_sticky_account(fresh["id"], provider)
+                _set_sticky_account(fresh["id"], provider, model)
             return fresh
     return None
 
@@ -1053,6 +1398,7 @@ def get_account_status(account: dict) -> dict:
         "credit_used_pct": credit_used_pct,
         "credit_source": "local_snapshot" if credit_snapshot > 0 else "usage_only",
         "last_used_at": account.get("last_used_at"),
+        "site_group": sites.site_group(account.get("domain")),
     }
 
 

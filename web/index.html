@@ -374,6 +374,34 @@ table{font-size:12px}.table-scroll{background:#fff}th{padding:9px 12px;backgroun
 <div id="app"></div>
 <script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.min.js"></script>
 <script>
+// 致命错误兜底：Vue 由 CDN 提供，若加载失败或初始化抛错，整页会白屏且没有任何提示。
+// 先把"把错误显示到页面上"的能力装到 window，后续任何未捕获错误都能看见。
+(function(){
+  function show(msg){
+    try{
+      var box=document.getElementById("ui-error");
+      if(!box){
+        box=document.createElement("div");
+        box.id="ui-error";
+        box.setAttribute("style","position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:42vh;overflow:auto;padding:12px 16px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#3a1114;color:#ffd9dc;border-top:1px solid #a33;white-space:pre-wrap;cursor:pointer");
+        box.title="点击关闭";
+        box.onclick=function(){if(box.parentNode)box.parentNode.removeChild(box)};
+        document.body.appendChild(box);
+      }
+      if(box.textContent.length>4000)return;
+      box.textContent+="["+new Date().toLocaleTimeString("zh-CN")+"] "+msg+"\n";
+    }catch(e){}
+  }
+  window.__cbFatal=show;
+  window.addEventListener("error",function(e){
+    var t=e&&e.target;
+    if(t&&t!==window&&t.tagName){
+      if(t.tagName==="SCRIPT")show("脚本加载失败（检查网络或 CDN 可达性）: "+(t.src||"unknown"));
+      return;
+    }
+    show("未捕获错误: "+((e&&e.message)||"unknown"));
+  },true);
+})();
 const{createApp,ref,reactive,computed,onMounted}=Vue;
 const I={
   dash:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>',
@@ -398,7 +426,7 @@ const api={
   async del(p,t){const h={};if(t)h.Authorization='Bearer '+t;const r=await fetch(p,{method:'DELETE',headers:h,credentials:'same-origin'});if(!r.ok)throw new Error(r.status);return r.json()},
 };
 function apiErr(e,fallback='加载失败'){return e.message==='401'?'管理凭证无效，请在设置页填写配置的 Admin Token。':e.message==='403'?'请求来源不被允许，请使用网关的本机地址打开。':fallback}
-createApp({
+const app=createApp({
   setup(){
     const validPages=['accounts','dashboard','keys','models','logs','settings'];
     const savedPage=localStorage.getItem('cb_gw_page');
@@ -688,7 +716,7 @@ createApp({
   </template>
 </div>`
 }).component('accs',{props:['token','toast'],setup(p){
-  const l=ref([]),ld=ref(true),sa=ref(false),ai=ref(''),nm=ref(''),disc=ref(null),dl=ref(false),scanning=ref(false),adding=ref(false),authPath=ref(''),test=ref(null),claim=ref(null),pkg=ref(null),tl=ref(0),claimingAll=ref(false),officialRefreshing=ref(false),checkins=ref({}),checkinSummary=ref(null),checkinLoading=ref(false),busy=ref({}),discChannel=ref('workbuddy'),channels=ref([{id:'workbuddy',display_name:'WorkBuddy'},{id:'qclaw',display_name:'QClaw'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'traework',display_name:'TraeWork'}]),catalogs=ref({}),importSummary=ref([]);
+  const l=ref([]),ld=ref(true),sa=ref(false),ai=ref(''),nm=ref(''),disc=ref(null),dl=ref(false),scanning=ref(false),adding=ref(false),authPath=ref(''),test=ref(null),claim=ref(null),pkg=ref(null),tl=ref(0),claimingAll=ref(false),officialRefreshing=ref(false),resetting=ref(false),checkins=ref({}),checkinSummary=ref(null),checkinLoading=ref(false),busy=ref({}),discChannel=ref('workbuddy'),channels=ref([{id:'workbuddy',display_name:'WorkBuddy'},{id:'qclaw',display_name:'QClaw'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'traework',display_name:'TraeWork'}]),catalogs=ref({}),importSummary=ref([]);
   const filters=reactive({q:'',status:'all',claim:'all',sort:'priority'});
   function hydrate(a){return {...a,_weight:a.weight||1,_priority:a.priority||0,_creditSnapshot:a.credit_snapshot||a.credit_limit||0,_baseWeight:a.weight||1,_basePriority:a.priority||0,_baseCreditSnapshot:a.credit_snapshot||a.credit_limit||0}}
   function dirty(a){return Number(a._weight||1)!==Number(a._baseWeight||1)||Number(a._priority||0)!==Number(a._basePriority||0)||Number(a._creditSnapshot||0)!==Number(a._baseCreditSnapshot||0)}
@@ -739,8 +767,21 @@ createApp({
   async function claimOne(a){await withBusy(a,'claim',async()=>{try{const r=await api.post('/admin/accounts/'+a.id+'/checkin',{},p.token);checkins.value={...checkins.value,[a.id]:r};claim.value={title:'领取结果',results:[r]};p.toast(r.claimed?'领取成功':(r.already_claimed?'今日已领':'领取失败'),r.ok?'ok':'err');await load();const fresh=l.value.find(x=>Number(x.id)===Number(a.id));if(fresh)await refreshResource(fresh,true,true);await loadCheckins(true)}catch(e){p.toast(apiErr(e,'领取失败'),'err')}})}
   async function claimAll(){if(claimingAll.value)return;claimingAll.value=true;try{const r=await api.post('/admin/accounts/checkin-all',{},p.token);claim.value={title:'一键领取结果',summary:r,results:r.results||[]};p.toast('领取 '+r.claimed+' · 已领 '+r.already_claimed+' · 失败 '+r.failed,r.failed?'err':'ok');await load(true);await loadCheckins(true)}catch(e){p.toast(apiErr(e,'一键领取失败'),'err')}claimingAll.value=false}
   async function del(a){if(!confirm('删除账号 '+(a.nickname||a.name||a.id)+' ?'))return;await api.del('/admin/accounts/'+a.id,p.token);p.toast('已删除');await load();await discover(authPath.value)}
+  // total_requests 是选路依据（越小越先用）但只增不减：历史请求多的账号会永远排在后面，
+  // 表现就是「请求只打在一两个最闲的账号上」。归零让现有账号重新回到同一水位。
+  async function resetCounts(){
+    if(resetting.value)return;
+    if(!confirm('把全部账号的请求计数归零？\n\n这只影响选路均衡，不会影响已发的请求和累计 Token / 已用额度。'))return;
+    resetting.value=true;
+    try{const r=await api.post('/admin/accounts/reset-request-counts',{},p.token);p.toast('已归零 '+r.accounts+' 个账号的请求计数','ok');await load()}
+    catch(e){p.toast(apiErr(e,'重置失败'),'err')}
+    resetting.value=false;
+  }
   function fmt(t){return t?new Date(t*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'-'}
   function size(v){v=Number(v||0);if(v>=1024*1024)return(v/1024/1024).toFixed(1)+' MB';if(v>=1024)return(v/1024).toFixed(1)+' KB';return v+' B'}
+  // 账号会打到哪个站点：国内版凭证与国际版不通用，跨站会被上游 401。
+  // 域名来自本机登录文件里的 auth.domain，导入时自动读取。
+  function siteLabel(a){const d=String(a.domain||'').trim().replace(/^https?:\/\//i,'').replace(/\/+$/,'').toLowerCase();if(!d)return '站点 未知 · 走全局上游';return (d.endsWith('.cn')?'国内版 · ':'国际版 · ')+d}
   function credit(v){v=Number(v||0);return v.toLocaleString('zh-CN',{maximumFractionDigits:4})}
   function tok(v){v=Number(v||0);if(v>=1e9)return (v/1e9).toFixed(v>=1e10?1:2).replace(/\.?0+$/,'')+'B';if(v>=1e6)return (v/1e6).toFixed(v>=1e7?1:2).replace(/\.?0+$/,'')+'M';return v.toLocaleString()}
   function creditPct(a){return Math.max(0,Math.min(100,Number(a.credit_used_pct||0)))+'%'}
@@ -783,7 +824,7 @@ createApp({
   function expireText(x){if(x.expired)return '已过期';if(x.days_to_expire===null||x.days_to_expire===undefined)return x.expire_time||'长期';if(x.days_to_expire<0)return '已过期';if(x.days_to_expire<=7)return x.days_to_expire+' 天内';return shortTime(x.expire_time)}
   function pkgBadge(x){if(x.expired)return 'err';if(Number(x.days_to_expire)>=0&&Number(x.days_to_expire)<=7)return 'inactive';return 'ok'}
   function clearPath(){authPath.value='';discover('')}
-  onMounted(()=>{loadChannels();loadCatalogs();load(true);discover()});return{l,visibleAccounts,filters,ld,sa,ai,nm,disc,dl,scanning,adding,authPath,test,testModels,claim,pkg,tl,claimingAll,officialRefreshing,checkins,checkinSummary,checkinLoading,busyKey,dirty,load,loadCheckins,discover,scan,importSummary,add,ref2,saveMeta,toggle,openTest,closeTest,runTest,claimOne,claimAll,refreshAllResources,openPackages,refreshPackages,del,fmt,size,credit,tok,creditPct,claimText,officialBalance,officialHasValue,officialMain,officialMeta,cacheAge,officialWarn,checkinClass,checkinText,tokenLife,shortTime,expireText,pkgBadge,clearPath,I,discChannel,channels}
+  onMounted(()=>{loadChannels();loadCatalogs();load(true);discover()});return{l,visibleAccounts,filters,ld,sa,ai,nm,disc,dl,scanning,adding,authPath,test,testModels,claim,pkg,tl,claimingAll,officialRefreshing,checkins,checkinSummary,checkinLoading,busyKey,dirty,load,loadCheckins,discover,scan,importSummary,add,ref2,saveMeta,toggle,openTest,closeTest,runTest,claimOne,claimAll,refreshAllResources,refreshResource,openPackages,refreshPackages,del,resetCounts,resetting,fmt,size,credit,tok,creditPct,claimText,officialBalance,officialHasValue,officialMain,officialMeta,cacheAge,officialWarn,checkinClass,checkinText,tokenLife,shortTime,expireText,pkgBadge,siteLabel,clearPath,I,discChannel,channels}
 },template:`
 <div>
   <div class="phead"><h1>账号管理</h1><p>粘性主账号 · 失败自动切换</p></div>
@@ -813,11 +854,12 @@ createApp({
             <h4>默认扫描目录</h4>
             <div v-if="disc?.dirs?.length">
               <div class="detect-path" v-for="d in disc.dirs" :key="d.path">
-                <span class="badge" :class="d.exists?(d.file_count?'ok':'inactive'):'err'">{{d.exists?d.file_count+' 个文件':'不存在'}}</span>
+                <span class="badge" :class="d.exists?(d.readable?(d.file_count?'ok':'inactive'):'err'):'err'">{{d.exists?(d.readable?(d.file_count+' 个文件'):'无权限'):'不存在'}}</span>
                 <code :title="d.path">{{d.path}}</code>
               </div>
             </div>
             <div class="muted" v-else>暂无目录信息</div>
+            <div class="hint" v-if="disc?.dirs?.some(d=>d.exists&&d.readable===false)" style="margin-top:8px">有目录存在但读不到：通常是网关进程继承了 WorkBuddy 沙箱对该路径的拦截（这个路径不受 macOS「完全磁盘访问权限」管辖，给终端授权无效）。请改用非 WorkBuddy 派生的终端（如从 Dock 打开的 Ghostty / iTerm）重启网关；也可以把该目录里的 <span class="mono">.info</span> 复制到普通目录后填到右侧自定义路径。</div>
           </div>
           <div class="detect-box">
             <h4>自定义路径</h4>
@@ -838,10 +880,10 @@ createApp({
       </template>
     </div>
   </div>
-  <div class="tbar"><button class="btn s" @click="load(true)" :disabled="ld||officialRefreshing"><span v-html="I.refresh"></span>{{ld?'刷新中':'刷新列表'}}</button><button class="btn s" @click="refreshAllResources()" :disabled="officialRefreshing||!l.some(a=>a.status==='active')">{{officialRefreshing?'刷新中':'刷新官方额度'}}</button><button class="btn s" @click="loadCheckins(true)" :disabled="checkinLoading">{{checkinLoading?'读取中':'刷新领取状态'}}</button><button class="btn s pri" @click="claimAll" :disabled="claimingAll||!l.some(a=>a.status==='active')">{{claimingAll?'领取中':'一键领取今日积分'}}</button><button class="btn s" @click="sa=true"><span v-html="I.plus"></span>高级手动添加</button><div class="spacer"></div><span class="tag" v-if="checkinSummary">可领 {{checkinSummary.available}} · 已领 {{checkinSummary.already_claimed}}</span><span class="tag" v-if="l.length">{{visibleAccounts.length}}/{{l.length}}个 · {{l.filter(a=>a.status==='active').length}}活跃</span></div>
+  <div class="tbar"><button class="btn s" @click="load(true)" :disabled="ld||officialRefreshing"><span v-html="I.refresh"></span>{{ld?'刷新中':'刷新列表'}}</button><button class="btn s" @click="refreshAllResources()" :disabled="officialRefreshing||!l.some(a=>a.status==='active')">{{officialRefreshing?'刷新中':'刷新官方额度'}}</button><button class="btn s" @click="loadCheckins(true)" :disabled="checkinLoading">{{checkinLoading?'读取中':'刷新领取状态'}}</button><button class="btn s pri" @click="claimAll" :disabled="claimingAll||!l.some(a=>a.status==='active')">{{claimingAll?'领取中':'一键领取今日积分'}}</button><button class="btn s" @click="sa=true"><span v-html="I.plus"></span>高级手动添加</button><button class="btn s" @click="resetCounts" :disabled="resetting||!l.length">{{resetting?'重置中':'重置请求计数'}}</button><div class="spacer"></div><span class="tag" v-if="checkinSummary">可领 {{checkinSummary.available}} · 已领 {{checkinSummary.already_claimed}}</span><span class="tag" v-if="l.length">{{visibleAccounts.length}}/{{l.length}}个 · {{l.filter(a=>a.status==='active').length}}活跃</span></div>
   <div v-if="ld" class="load"><div class="spin"></div></div>
   <div class="card" v-else-if="l.length"><div class="card-h">账号列表<span class="sub">同一列按通道单位展示：积分与 QClaw 今日 token 不混加；到期包仅 WorkBuddy</span></div><div class="card-p" style="padding-bottom:0"><div class="control-row"><input class="searchbox" v-model="filters.q" placeholder="搜索账号 / UID / 域名"/><select class="selectctl" v-model="filters.status"><option value="all">全部状态</option><option value="active">active</option><option value="inactive">inactive</option><option value="expired">expired</option></select><select class="selectctl" v-model="filters.claim"><option value="all">全部领取状态</option><option value="available">可领取</option><option value="claimed">今日已领</option><option value="failed">领取失败</option></select><select class="selectctl" v-model="filters.sort"><option value="priority">优先级 / 权重</option><option value="balance">官方余额高到低</option><option value="expire">最近到期优先</option><option value="requests">请求数高到低</option><option value="used">累计已用高到低</option></select><div class="spacer"></div><span class="tag">当前 {{visibleAccounts.length}} 条</span></div></div><div class="table-scroll"><table><thead><tr><th>账号</th><th>通道</th><th>UID</th><th>状态</th><th>今日领取</th><th>权重</th><th>优先级</th><th>官方余额</th><th>即将到期</th><th>本地估算</th><th>本地快照</th><th>Token 有效期</th><th>请求</th><th>Token</th><th>累计已用</th><th></th></tr></thead><tbody>
-    <tr v-for="a in visibleAccounts" :key="a.id"><td style="font-weight:600">{{a.nickname||a.name}} <span class="tag warn" v-if="dirty(a)">未保存</span></td><td><span class="tag">{{a.provider||'workbuddy'}}</span></td><td class="mono">{{a.uid?.slice(0,8)}}…</td><td><span class="badge" :class="a.status">{{a.status}}</span></td><td><span class="badge" :class="checkinClass(a)">{{checkinText(a)}}</span><div class="cache-note" v-if="checkins[a.id]?.stale">旧缓存</div></td><td><input class="numctl" v-model.number="a._weight" type="number" min="1" max="100"/></td><td><input class="numctl" v-model.number="a._priority" type="number" min="-100" max="100"/></td><td class="official-cell"><div class="official-main"><span class="official-val" :class="{unset:!officialHasValue(a)}">{{officialMain(a)}}</span><button class="btn s" @click="openPackages(a)" :disabled="busyKey(a.id,'resource')">明细</button></div><div class="official-meta" :class="{'pkg-warn':officialWarn(a)}">{{officialMeta(a)}}</div><div class="cache-note" v-if="a.official_resource">缓存 {{cacheAge(a)}}</div></td><td class="official-cell"><template v-if="(a.provider||'workbuddy')==='workbuddy'"><div class="official-main"><span class="official-val" :class="{'pkg-warn':officialWarn(a)}">{{credit(a.official_resource?.expiring_30d_total)}}</span><span class="tag" v-if="a.official_resource?.next_expire_time">{{shortTime(a.official_resource.next_expire_time)}}</span></div><div class="official-meta">最近到期 {{credit(a.official_resource?.next_expire_amount)}} · {{a.official_resource?.next_expire_days??'-'}} 天</div></template><span class="official-val unset" v-else>—</span></td><td class="credit-cell"><div class="credit-main"><span class="credit-rem" v-if="a.credit_snapshot>0">{{credit(a.credit_remaining)}}</span><span class="credit-rem unset" v-else>未设置</span><span class="tag">{{a.credit_snapshot>0?credit(a.credit_used_pct)+'%':'备用'}}</span></div><div class="progress" :class="{err:a.credit_snapshot>0&&a.credit_used_pct>=90,ok:a.credit_snapshot>0&&a.credit_used_pct<70}"><span :style="{width:creditPct(a)}"></span></div><div class="credit-meta">{{a.credit_snapshot>0?'快照后已用 '+credit(a.credit_since_snapshot):'官方失败时可手动校准'}}</div></td><td><input class="numctl credit" v-model.number="a._creditSnapshot" type="number" min="0" step="0.01" placeholder="0"/></td><td>{{tokenLife(a)}}</td><td>{{a.total_requests}}</td><td>{{tok(a.total_tokens)}}</td><td>{{credit(a.total_credits)}}</td><td><div class="ops"><button class="btn s" @click="saveMeta(a)" :disabled="!dirty(a)||busyKey(a.id,'save')">{{busyKey(a.id,'save')?'保存中':'保存'}}</button><button class="btn s" @click="refreshResource(a,false,true)" :disabled="busyKey(a.id,'resource')||a.status!=='active'">{{busyKey(a.id,'resource')?'刷新中':'额度'}}</button><button class="btn s" @click="claimOne(a)" :disabled="busyKey(a.id,'claim')||a.status!=='active'">{{busyKey(a.id,'claim')?'领取中':'领取'}}</button><button class="btn s" @click="toggle(a)" :disabled="busyKey(a.id,'toggle')">{{busyKey(a.id,'toggle')?'处理中':(a.status==='active'?'禁用':'启用')}}</button><button class="btn s" @click="openTest(a)" :disabled="tl===a.id">{{tl===a.id?'测试中':'测试'}}</button><button class="btn s" @click="ref2(a)" :disabled="busyKey(a.id,'refresh')">{{busyKey(a.id,'refresh')?'刷新中':'刷新'}}</button><button class="btn s danger" @click="del(a)">删除</button></div></td></tr>
+    <tr v-for="a in visibleAccounts" :key="a.id"><td style="font-weight:600">{{a.nickname||a.name}} <span class="tag warn" v-if="dirty(a)">未保存</span><div class="cache-note">{{siteLabel(a)}}</div></td><td><span class="tag">{{a.provider||'workbuddy'}}</span></td><td class="mono">{{a.uid?.slice(0,8)}}…</td><td><span class="badge" :class="a.status">{{a.status}}</span></td><td><span class="badge" :class="checkinClass(a)">{{checkinText(a)}}</span><div class="cache-note" v-if="checkins[a.id]?.stale">旧缓存</div></td><td><input class="numctl" v-model.number="a._weight" type="number" min="1" max="100"/></td><td><input class="numctl" v-model.number="a._priority" type="number" min="-100" max="100"/></td><td class="official-cell"><div class="official-main"><span class="official-val" :class="{unset:!officialHasValue(a)}">{{officialMain(a)}}</span><button class="btn s" @click="openPackages(a)" :disabled="busyKey(a.id,'resource')">明细</button></div><div class="official-meta" :class="{'pkg-warn':officialWarn(a)}">{{officialMeta(a)}}</div><div class="cache-note" v-if="a.official_resource">缓存 {{cacheAge(a)}}</div></td><td class="official-cell"><template v-if="(a.provider||'workbuddy')==='workbuddy'"><div class="official-main"><span class="official-val" :class="{'pkg-warn':officialWarn(a)}">{{credit(a.official_resource?.expiring_30d_total)}}</span><span class="tag" v-if="a.official_resource?.next_expire_time">{{shortTime(a.official_resource.next_expire_time)}}</span></div><div class="official-meta">最近到期 {{credit(a.official_resource?.next_expire_amount)}} · {{a.official_resource?.next_expire_days??'-'}} 天</div></template><span class="official-val unset" v-else>—</span></td><td class="credit-cell"><div class="credit-main"><span class="credit-rem" v-if="a.credit_snapshot>0">{{credit(a.credit_remaining)}}</span><span class="credit-rem unset" v-else>未设置</span><span class="tag">{{a.credit_snapshot>0?credit(a.credit_used_pct)+'%':'备用'}}</span></div><div class="progress" :class="{err:a.credit_snapshot>0&&a.credit_used_pct>=90,ok:a.credit_snapshot>0&&a.credit_used_pct<70}"><span :style="{width:creditPct(a)}"></span></div><div class="credit-meta">{{a.credit_snapshot>0?'快照后已用 '+credit(a.credit_since_snapshot):'官方失败时可手动校准'}}</div></td><td><input class="numctl credit" v-model.number="a._creditSnapshot" type="number" min="0" step="0.01" placeholder="0"/></td><td>{{tokenLife(a)}}</td><td>{{a.total_requests}}</td><td>{{tok(a.total_tokens)}}</td><td>{{credit(a.total_credits)}}</td><td><div class="ops"><button class="btn s" @click="saveMeta(a)" :disabled="!dirty(a)||busyKey(a.id,'save')">{{busyKey(a.id,'save')?'保存中':'保存'}}</button><button class="btn s" @click="refreshResource(a,false,true)" :disabled="busyKey(a.id,'resource')||a.status!=='active'">{{busyKey(a.id,'resource')?'刷新中':'额度'}}</button><button class="btn s" @click="claimOne(a)" :disabled="busyKey(a.id,'claim')||a.status!=='active'">{{busyKey(a.id,'claim')?'领取中':'领取'}}</button><button class="btn s" @click="toggle(a)" :disabled="busyKey(a.id,'toggle')">{{busyKey(a.id,'toggle')?'处理中':(a.status==='active'?'禁用':'启用')}}</button><button class="btn s" @click="openTest(a)" :disabled="tl===a.id">{{tl===a.id?'测试中':'测试'}}</button><button class="btn s" @click="ref2(a)" :disabled="busyKey(a.id,'refresh')">{{busyKey(a.id,'refresh')?'刷新中':'刷新'}}</button><button class="btn s danger" @click="del(a)">删除</button></div></td></tr>
     <tr v-if="!visibleAccounts.length"><td colspan="16" class="empty">没有匹配的账号</td></tr>
   </tbody></table></div></div>
   <div class="card card-p empty" v-else><div class="em">🔌</div><p>暂无账号 · 先使用上方本机登录检测导入</p></div>
@@ -937,6 +979,10 @@ createApp({
 </div>`
 }).component('mdls',{props:['token','toast'],setup(p){
   const al=ref({}),builtinKeys=ref({}),aliasChannel=ref('workbuddy'),ld=ref(true),sources=ref([]),syncing=ref(false),adding=ref(false),addOpen=ref(false);
+  // 站点偏好：同一个模型在国内站与国际站计费不同（deepseek-v4.1-flash 国际站免费、
+  // 国内站扣额度），所以按模型选优先用哪边的账号。空串=不区分。
+  const sitePref=ref({default:'',models:{}}),siteDefault=ref('');
+  const siteGroups=[{id:'',label:'不区分'},{id:'international',label:'国际版优先'},{id:'domestic',label:'国内版优先'}];
   const FALLBACK_CH=[{id:'workbuddy',display_name:'WorkBuddy'},{id:'qclaw',display_name:'QClaw'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'traework',display_name:'TraeWork'}];
   const addForm=reactive({channel:'workbuddy',id:'',name:''});
   const newKey=ref(''),newVal=ref('');
@@ -947,7 +993,16 @@ createApp({
     al.value=maps;builtinKeys.value=keys;
     if(!maps[aliasChannel.value]&&channels.value.length)aliasChannel.value=channels.value[0].id;
   }
-  async function load(){ld.value=true;try{try{applyAliasSnapshot(await api.get('/admin/aliases',p.token))}catch(e){al.value={};builtinKeys.value={}}try{const snap=await api.get('/admin/models/catalogs',p.token);sources.value=snap.sources||[]}catch(e){sources.value=[]}}catch(e){p.toast('失败','err')}ld.value=false}
+  async function load(){ld.value=true;try{try{applyAliasSnapshot(await api.get('/admin/aliases',p.token))}catch(e){al.value={};builtinKeys.value={}}try{const snap=await api.get('/admin/models/catalogs',p.token);sources.value=snap.sources||[]}catch(e){sources.value=[]}try{applySitePref(await api.get('/admin/site-preference',p.token))}catch(e){applySitePref({})}}catch(e){p.toast('失败','err')}ld.value=false}
+  function applySitePref(snap){const models={...(snap&&snap.models||{})};sitePref.value={default:(snap&&snap.default)||'',models};siteDefault.value=(snap&&snap.default)||''}
+  function siteFor(id){return sitePref.value.models[id]||''}
+  function setSiteFor(id,v){const models={...sitePref.value.models};if(v)models[id]=v;else delete models[id];sitePref.value={default:sitePref.value.default,models}}
+  async function saveSitePref(){
+    try{
+      const r=await api.put('/admin/site-preference',{default:siteDefault.value||'',models:sitePref.value.models},p.token);
+      applySitePref(r);p.toast('站点偏好已保存');
+    }catch(e){p.toast(apiErr(e,'保存失败'),'err')}
+  }
   async function refreshCatalogs(){try{const snap=await api.get('/admin/models/catalogs',p.token);sources.value=snap.sources||[]}catch(e){}}
   async function save(){
     try{
@@ -1008,10 +1063,12 @@ createApp({
   function modeText(s){return s.mode==='live'?'在线读取':(s.mode==='fallback'?'回退本地':'未读取')}
   function modeClass(s){return s.mode==='live'?'ok':(s.mode==='fallback'?'warn':'')}
   const modelSources=computed(()=>channels.value.map(c=>{const s=sources.value.find(x=>x.channel===c.id)||{};return {...s,channel:c.id,display_name:c.display_name,models:s.models||[]}}));
+  // 站点偏好按「裸模型 id」保存，跨通道同名模型共用一条配置，所以这里按 id 去重。
+  const siteRows=computed(()=>{const out=[],seen=new Set();modelSources.value.forEach(s=>{(s.models||[]).forEach(x=>{const id=String(x.id||'');if(!id||seen.has(id))return;seen.add(id);out.push({id,name:x.name||id,channel:s.channel})})});return out});
   const aliasRows=computed(()=>al.value[aliasChannel.value]||{});
   const aliasTargets=computed(()=>{const s=modelSources.value.find(x=>x.channel===aliasChannel.value);return s?s.models:[]});
   const aliasChannelName=computed(()=>(channels.value.find(c=>c.id===aliasChannel.value)||{}).display_name||aliasChannel.value);
-  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,aliasChannel,aliasRows,aliasTargets,aliasChannelName,I}
+  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,aliasChannel,aliasRows,aliasTargets,aliasChannelName,sitePref,siteDefault,siteGroups,siteRows,siteFor,setSiteFor,saveSitePref,I}
 },template:`
 <div>
   <div class="phead"><h1>模型配置</h1><p>四通道目录均来自上游或本地回退；自定义模型用“添加模型”，官方条目不改名</p></div>
@@ -1020,6 +1077,19 @@ createApp({
     <table><thead><tr><th>通道</th><th>方式</th><th>数量</th><th>说明</th></tr></thead><tbody>
     <tr v-for="s in sources" :key="s.channel"><td>{{s.display_name||s.channel}} <span class="tag">{{s.channel}}</span></td><td><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></td><td>{{s.count||0}}</td><td class="mono" style="color:var(--fg3)">{{s.message||'—'}}</td></tr>
     </tbody></table>
+  </div>
+  <div class="card" style="margin-bottom:12px">
+    <div class="card-h">站点偏好<span class="sub">同一个模型两边计费不同时，优先用哪边的账号</span></div>
+    <div class="hint" style="padding:8px 16px">国内版与国际版分开计费（实测 deepseek-v4.1-flash 国际版免费、国内版扣额度），所以可以按模型指定优先用哪边。只影响优先级：偏好那边没有可用账号（或都已试过）时会自动退回另一边，不会让请求无账号可用。</div>
+    <div style="padding:8px 16px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <label style="font-size:12px;color:var(--fg2)">未单独配置的模型</label>
+      <select class="selectctl" v-model="siteDefault" aria-label="默认站点偏好"><option v-for="g in siteGroups" :key="'d-'+g.id" :value="g.id">{{g.label}}</option></select>
+      <button class="btn s pri" @click="saveSitePref">保存站点偏好</button>
+    </div>
+    <div class="table-scroll"><table><thead><tr><th>模型 ID</th><th>通道</th><th>站点偏好</th></tr></thead><tbody>
+    <tr v-for="x in siteRows" :key="'site-'+x.id"><td class="mono">{{x.id}}</td><td><span class="tag">{{x.channel}}</span></td><td><select class="selectctl" :value="siteFor(x.id)" @change="setSiteFor(x.id,$event.target.value)" :aria-label="'站点偏好 '+x.id"><option v-for="g in siteGroups" :key="x.id+'-'+g.id" :value="g.id">{{g.label}}</option></select></td></tr>
+    <tr v-if="!siteRows.length"><td colspan="3" class="empty">暂无模型</td></tr>
+    </tbody></table></div>
   </div>
   <div class="card" v-for="s in modelSources" :key="'cat-'+s.channel" style="margin-bottom:12px">
     <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{s.models.length}} 个模型</span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></div>
@@ -1102,7 +1172,7 @@ createApp({
   <div class="card card-p empty" v-else><div class="em">📋</div><p>暂无记录</p></div>
 </div>`
 }).component('stgs',{props:['token','toast','saveToken'],setup(p){
-  const defaults={backend_url:'https://copilot.tencent.com',default_domain:'www.codebuddy.cn',timeout:300,base_url:'http://127.0.0.1:8787/v1',admin_auth:localMode?'本机自动授权':'Admin Token',data_file:'codebuddy_gateway.db'};
+  const defaults={backend_url:'https://copilot.tencent.com',default_domain:'www.codebuddy.cn',timeout:300,auth_failure_threshold:3,base_url:'http://127.0.0.1:8787/v1',admin_auth:localMode?'本机自动授权':'Admin Token',data_file:'codebuddy_gateway.db'};
   const s=ref({...defaults}),stats=ref(null),ld=ref(true),saving=ref(false),copied=ref(''),setupTab=ref('codex'),adminToken=ref(p.token||'');
   const keysList=ref([]),codexKeyInput=ref(''),codexStatus=ref(null),codexBusy=ref(false),codexResult=ref(null);
   const presets={
@@ -1115,8 +1185,8 @@ createApp({
     curl:{name:'curl',base:'http://127.0.0.1:8787/v1',model:'auto',note:'用于快速验证服务、Key 和模型映射是否正常。'},
   };
   async function load(){ld.value=true;try{const cfg=await api.get('/admin/settings',p.token);s.value={...defaults,...cfg};stats.value=await api.get('/admin/stats',p.token);keysList.value=await api.get('/admin/api-keys',p.token);if(keysList.value.length&&!codexKeyInput.value)codexKeyInput.value=keysList.value.find(k=>k.key)?.key||'';try{codexStatus.value=await api.get('/admin/codex/status',p.token)}catch(e){}}catch(e){p.toast(apiErr(e,'加载失败'),'err')}ld.value=false}
-  async function save(){if(saving.value)return;saving.value=true;try{await api.put('/admin/settings',{backend_url:s.value.backend_url,default_domain:s.value.default_domain,timeout:Number(s.value.timeout)||300},p.token);p.toast('已保存')}catch(e){p.toast(apiErr(e,'保存失败'),'err')}saving.value=false}
-  function resetDefaults(){s.value={...s.value,backend_url:defaults.backend_url,default_domain:defaults.default_domain,timeout:defaults.timeout};p.toast('已恢复默认','info')}
+  async function save(){if(saving.value)return;saving.value=true;try{await api.put('/admin/settings',{backend_url:s.value.backend_url,default_domain:s.value.default_domain,timeout:Number(s.value.timeout)||300,auth_failure_threshold:Number(s.value.auth_failure_threshold)||3},p.token);p.toast('已保存')}catch(e){p.toast(apiErr(e,'保存失败'),'err')}saving.value=false}
+  function resetDefaults(){s.value={...s.value,backend_url:defaults.backend_url,default_domain:defaults.default_domain,timeout:defaults.timeout,auth_failure_threshold:defaults.auth_failure_threshold};p.toast('已恢复默认','info')}
   function saveAdminToken(){p.saveToken(adminToken.value)}
   function clearAdminToken(){adminToken.value='';p.saveToken('')}
   async function codexSetup(){
@@ -1160,6 +1230,7 @@ createApp({
           <div class="field"><label>后端地址</label><input v-model="s.backend_url" placeholder="https://copilot.tencent.com"/><div class="hint">上游 Work Buddy 服务地址。</div></div>
           <div class="field"><label>默认域名</label><input v-model="s.default_domain" placeholder="www.codebuddy.cn"/><div class="hint">账号 auth 中没有 domain 时使用。</div></div>
           <div class="field"><label>请求超时（秒）</label><input v-model="s.timeout" type="number" min="30" max="900" placeholder="300"/><div class="hint">长上下文或慢模型建议保持 300。</div></div>
+          <div class="field"><label>鉴权失败阈值</label><input v-model="s.auth_failure_threshold" type="number" min="1" max="20" placeholder="3"/><div class="hint">连续多少次 401/403 才把账号判为失效（判定前会先真实复核一次凭证）。</div></div>
           <div class="field"><label>管理鉴权</label><input v-model="s.admin_auth" disabled/></div>
         </div>
       </div>
@@ -1273,7 +1344,15 @@ createApp({
     </div>
   </template>
 </div>`
-}).mount('#app');
+});
+// 渲染/运行时异常兜底。
+// Vue 未配置 errorHandler 时，模板求值抛错只会静默失败（该组件渲染成空），页面看起来"啥都没有"。
+// 复用上面的 __cbFatal，把错误显示到页面底部，避免无提示白屏。
+app.config.errorHandler=function(err,inst,info){
+  console.error("[ui]",err,info);
+  if(window.__cbFatal)window.__cbFatal((info||"error")+": "+((err&&err.message)||String(err)));
+};
+app.mount("#app");
 </script>
 </body>
 </html>

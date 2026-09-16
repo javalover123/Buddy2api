@@ -49,8 +49,9 @@ Buddy2api 今天是单一厂商网关：`server.py` 把 `/v1/chat/completions` �
 | 层 | 文件 | 现状 |
 |---|---|---|
 | HTTP 壳 | `server.py` | FastAPI：`/v1/*`、`/admin/*`、`web/index.html`。启动时 `auth_manager.auto_scan_and_import()` **静默入库** |
-| 账号 / Token / 签到 | `auth_manager.py` | 扫描 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info`；刷新 `/v2/plugin/auth/token/refresh`；签到 `/v2/billing/meter/*`；`pick_account()` 全局粘性；`pick_account_with_fallback` 遍历 **全部** `expired` 行 |
-| 指纹 | `fingerprint.py` | CLI/2.109.2、`X-IDE-*`、`x-stainless-*`、B3、`X-No-*`、按 domain 的 Origin。**Chat 请求禁止带 `X-Refresh-Token`** |
+| 账号 / Token / 签到 | `auth_manager.py` | 扫描 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info`；刷新 `/v2/plugin/auth/token/refresh`；签到 `/v2/billing/meter/*`；`pick_account()` **按模型能力过滤候选 + 按 (通道, 模型) 粘性**（见「多站点与模型路由」）；`pick_account_with_fallback` 遍历 **全部** `expired` 行 |
+| 站点判定 | `sites.py` | `is_cn_domain` / `site_group` / `site_url` —— 「账号属于哪个站」的**唯一定义**。`auth_manager.backend_url_for`（选上游域名）、`fingerprint.origin_for`（选 Origin/Referer）与站点偏好路由都引用它，禁止各写一套 |
+| 指纹 | `fingerprint.py` | CLI/2.109.2、`X-IDE-*`、`x-stainless-*`、B3、`X-No-*`、按 domain 的 Origin（判定见 `sites.py`）。**Chat 请求禁止带 `X-Refresh-Token`** |
 | 代理 | `proxy.py` | `BACKEND = "https://copilot.tencent.com"`；`httpx.AsyncClient`（未开 `http2=True`）；SSE 规范化、内容审核短拒答、tool stall 重试；流式 **第一个 SSE 字节之后不再换号**（`output_started`）；`DEFAULT_MODELS` 含未加前缀的 `glm-5.2` / `auto`；`resolve_model_alias` 未命中则 **原样返回** |
 | Responses 桥 | `responses.py` | `/v1/responses` → `proxy.proxy_chat_completions()` |
 | 存储 | `database.py` | `accounts` **无 `provider` 列**；`add_account` 显式列清单；uid 去重只在应用层；`get_active_accounts()` 跨全部行 |
@@ -71,9 +72,9 @@ async def chat_completions(...):
 ```657:695:proxy.py
 async def proxy_chat_completions(...):
     ...
-    account = await auth_manager.pick_account_with_fallback(tried_ids)
+    account = await auth_manager.pick_account_with_fallback(tried_ids, model=body.get("model"))
     ...
-    url = f"{auth_manager.backend_url()}/v2/chat/completions"
+    url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
 ```
 
 ```917:960:auth_manager.py
@@ -118,7 +119,8 @@ OpenCode 实际线上的 HTTP `model` 是 **models 对象的 key**，不是 `-m 
 - 一个 Git 仓库、一个 FastAPI 进程、一个 `/v1`。
 - WorkBuddy 成为第一个 provider（逻辑上；物理搬文件见 PR0）。
 - 控制面可跨通道；数据面一次绑定，永不静默切厂商，也永不把外通道裸 id 送给 Copilot。
-- 通道内保留 1.4.10：最高优先级粘性、weight、401/429 cooldown、最多 3 次 **同通道** failover；**第一个 SSE 字节之后不换号**。
+- 通道内保留 1.4.10：最高优先级、weight、401/429 cooldown、最多 3 次 **同通道** failover；**第一个 SSE 字节之后不换号**。
+  粘性改为 **按 (通道, 模型) 分槽**，并在粘住账号的归一负载明显高于同级最空闲账号时让位。
 - 命名空间模型 + 锁定的 bind 算法（KD-4）。**每把 API Key 必有 `default_channel`**；管理页下拉切换通道。
 - `accounts.provider` 默认 `workbuddy`；所有数据面账号查询 `WHERE provider=?`。
 - 缺目录不阻启动；QwenWork 在 0.1.8 冒烟前不得默认启用。
@@ -436,10 +438,32 @@ def list_accounts(*, provider: str | None = None) -> list[dict]:
     """控制面可按通道过滤；省略 provider 仅用于 admin 总表展示，不得用于 pick/refresh。"""
 ```
 
-粘性状态：`_sticky_account_id: dict[ChannelId, int]`，禁止全局一个 id。  
+粘性状态：`_sticky_account_id: dict[str, int]`，键是 `(通道, 模型)` 的组合（见 `_sticky_key`），禁止全局一个 id。
+按模型分槽是必需的：国内站与国际站的模型集几乎不重叠，共用一个槽会让「只属于另一个站的模型」永远被顶到错误的账号上。
 `idx_accounts_provider_status` 只是过滤辅助；排序仍用现有 `_route_sort_key`（priority、weight、`total_requests/weight`）。
 
 `expires_at` **一律存整数毫秒**（与今天 WorkBuddy `is_token_expired` 的 `time.time()*1000 - 60_000` 一致）。QwenWork 若返回 ISO `expires_at`，在 `refresh()` 写库前换成 ms。每个 provider 必须实现 `is_token_expired`，禁止 WorkBuddy 函数去比较 QwenWork 行。
+
+### 多站点与模型路由
+
+WorkBuddy 的 `domain` 决定账号属于哪个站点：`.cn` → 国内站（`www.workbuddy.cn` / `www.codebuddy.cn`），其余 → 全局 `backend_url`。
+两个站点的**凭证与模型集都不通用**：实测国际站 18 个模型、国内站 29 个，交集只有 3 个。
+
+由此定下三条规则：
+
+1. **选号必须按模型过滤。** 账号能力来自两处：供应商模型列表（`catalog.refresh_one` 采样通道内全部活跃账号后写回，见 `record_account_models`）与实测被拒记录（`mark_model_denied`）。
+   过滤**只调整优先级，不得把候选清空** —— 上游列表双向不准（漏报：国内站列表无 `kimi-k3` 但可用；超报：`glm-4.6` 在列表里却全站不可用），清空候选会退化成「明明有账号却报无可用账号」。
+2. **跨站发模型不是协议错误。** 上游回 HTTP 400 + `code 11102`（`model [...] service info not found` / `is only available for authorized users`）。
+   400 不在 `RETRYABLE_STATUS_CODES` 里，必须显式判定为「可换号」，**且不能给账号记失败**（账号本身是好的）。见 `proxy._model_unavailable_error`。
+3. **模型目录取并集。** 目录按「通道」存，只采样一个账号会让另一个站的模型整体从 `/v1/models` 消失。`catalog_accounts` 钩子返回该通道全部活跃账号。
+4. **同模型两边计费不同 → 站点偏好。** 实测 `deepseek-v4.1-flash` 国际站免费、国内站扣额度，所以「优先用哪边的账号」按模型配置（设置 `model_site_preference`，见 `site_preference.py`）。
+   与能力过滤同样是**只调优先级**：偏好站点没有账号、或账号都已被排除，就退回另一边的候选；默认不区分（空串），保证升级后行为不变。
+
+**请求计数只增不减，会自己把均衡拉坏。** `total_requests` 同时是「已用统计」与选路依据（`_route_sort_key` 里的 `total_requests/weight`），但它从不衰减：老账号的计数迟早远高于新导入的账号，「少的先用」就退化成「只有最闲的一两个在跑」，看起来像固定路由到一个账号。
+`pick_account` 的粘性容差（`_STICKY_LOAD_SLACK`）在这种差距下永远不会触发让位，所以靠容差修不了。提供 `db.reset_account_request_counts()`（管理页「重置请求计数」/ `POST /admin/accounts/reset-request-counts`）把水位拉到同一水平；只归零 `total_requests`，不动 `total_tokens` / `total_credits`。
+
+**鉴权失败的判定要抗抖动**：单次 401/403 不直接置 `expired`（混装站点时凭证被发到非所属站点会立刻 401，一次判死会永久停用仍有效的账号）。
+改为连续 `auth_failure_threshold` 次后，先用账号自己的站点做一次真实复核（`probe_account_credentials`），只有复核确认失效才置 `expired`；网络错误 / 5xx 一律不下结论。
 
 共享、通道无关：OpenAI SSE observer（8 MiB）。QwenWork 先剥外层再交给它。  
 **不共享：** 头、UA、TLS、HTTP 版本、签到 URL、模型别名、retry/stall/audit 策略。
@@ -1078,8 +1102,11 @@ PR8  2.0.0 发布
 - 启动默认不入库：**breaking UX**。
 - `GET /v1/models`：`owned_by` 不变；新增 `channel`。
 - Docker：`CB_AUTH_DIR=/auth` 对仍挂载的用户不变；缺目录不再让 helper 失败。
-- `backend_url` 设置只影响 WorkBuddy。
+- `backend_url` 设置只影响 WorkBuddy，且**只对非国内站账号生效**：`domain` 以 `.cn` 结尾的账号一律走它自己的站点（`auth_manager.backend_url_for`），因为国内版凭证发到国际站会被上游直接 401。
 - `checkin-all` 顶层 `credit` 仅 WorkBuddy 且 deprecated。
+- 站点偏好（`model_site_preference`）与请求计数归零都是**新增**：不配置、不点击时行为与之前完全一致，无 breaking。
+  - `PUT /admin/site-preference`：`{"default": "international"|"domestic"|"", "models": {模型: 同上}}`，非法值 400。
+  - `POST /admin/accounts/reset-request-counts`：只归零 `accounts.total_requests`。
 
 ---
 

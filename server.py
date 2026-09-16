@@ -741,6 +741,13 @@ async def admin_update_account(
     return {"status": "ok"}
 
 
+@app.post("/admin/accounts/reset-request-counts")
+async def admin_reset_request_counts(authorization: str | None = Header(default=None)):
+    """把全部账号的请求计数归零，让选路重新回到同一水位。"""
+    _check_admin(authorization)
+    return {"status": "ok", "accounts": db.reset_account_request_counts()}
+
+
 @app.delete("/admin/accounts/{aid}")
 async def admin_delete_account(
     aid: int,
@@ -748,6 +755,8 @@ async def admin_delete_account(
 ):
     _check_admin(authorization)
     db.delete_account(aid)
+    # 路由/能力状态按账号 id 存在内存里，账号删了要一并清掉
+    auth_manager.forget_account(aid)
     return {"status": "ok"}
 
 
@@ -1035,7 +1044,7 @@ async def admin_update_settings(
 ):
     _check_admin(authorization)
     data = await _read_json_object(request)
-    allowed_settings = {"backend_url", "default_domain", "timeout"}
+    allowed_settings = {"backend_url", "default_domain", "timeout", "auth_failure_threshold"}
     unknown = set(data) - allowed_settings
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unsupported settings: {', '.join(sorted(unknown))}")
@@ -1044,6 +1053,14 @@ async def admin_update_settings(
             data["timeout"] = max(5, min(600, int(data["timeout"])))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="timeout must be an integer between 5 and 600")
+    if "auth_failure_threshold" in data:
+        try:
+            data["auth_failure_threshold"] = max(1, min(20, int(data["auth_failure_threshold"])))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="auth_failure_threshold must be an integer between 1 and 20",
+            )
     if "backend_url" in data:
         backend_url = str(data["backend_url"]).strip().rstrip("/")
         if not backend_url.startswith("https://"):
@@ -1271,6 +1288,31 @@ async def admin_update_aliases(
     return {"status": "ok"}
 
 
+@app.get("/admin/site-preference")
+async def admin_get_site_preference(authorization: str | None = Header(default=None)):
+    _check_admin(authorization)
+    import site_preference
+
+    return site_preference.snapshot()
+
+
+@app.put("/admin/site-preference")
+async def admin_update_site_preference(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    _check_admin(authorization)
+    import site_preference
+
+    data = await _read_json_object(request)
+    try:
+        cleaned = site_preference.clean(data)
+    except site_preference.SitePreferenceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.set_setting("model_site_preference", cleaned)
+    return {"status": "ok", **site_preference.snapshot()}
+
+
 # ============================================================
 # Web UI
 # ============================================================
@@ -1412,6 +1454,11 @@ def main():
         threading.Thread(target=_open_when_ready, args=(server, url), daemon=True).start()
     try:
         server.run(sockets=[listener])
+    except KeyboardInterrupt:
+        # uvicorn 在优雅关闭结束后会按设计重新抛出 SIGINT（以便进程以信号方式退出），
+        # Python 默认处理器把它变成 KeyboardInterrupt。uvicorn CLI 里有 `except KeyboardInterrupt: pass`
+        # 兜底，而这里直接调用 Server.run，所以自行吞掉，避免 Ctrl+C 时打印无用 traceback。
+        pass
     finally:
         listener.close()
         instance_lock.close()

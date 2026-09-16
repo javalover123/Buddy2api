@@ -809,6 +809,26 @@ def api_key_increment_usage(kid: int, tokens: int):
         conn.close()
 
 
+def reset_account_request_counts() -> int:
+    """把全部账号的请求计数归零，返回受影响行数。
+
+    `total_requests` 是选路依据（排序 key 里的 total_requests/weight），但它只增不减：
+    历史请求多的账号会永远排在后面，结果就是「只有最闲的一两个账号在跑」，负载看起来
+    像固定路由到一个账号。归零是让现有账号重新回到同一水位的唯一办法，也避免为它引入
+    一套滑动窗口统计。
+
+    只动计数，不动 total_tokens / total_credits：那两个是展示用的累计值，归零会把
+    「累计已用」的历史弄丢。
+    """
+    with _lock:
+        conn = get_conn()
+        cur = conn.execute("UPDATE accounts SET total_requests = 0")
+        conn.commit()
+        affected = cur.rowcount
+        conn.close()
+        return affected
+
+
 # ============================================================
 # Logs
 # ============================================================
