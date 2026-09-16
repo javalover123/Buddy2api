@@ -1,17 +1,22 @@
-"""签到活动语义：`active=false` 是「该站点没有活动」，不是「领取失败」。
+"""签到活动语义：`active=false` 是「上游没开这个活动」，不是「领取失败」。
 
 回归（2026-09-16）：用户在国际站账号 `xiaoyaoaiqima`（domain=www.workbuddy.ai）
 上点「一键领取今日积分」，弹出「活动当前不可用」并计入 `failed`，看起来像服务故障。
 
-实查上游 `POST /v2/billing/meter/checkin-activity-status` 原始响应（按上面 payload 复刻）：
+实查上游原始响应（按下面 payload 复刻）：
 
-- 国际站 www.workbuddy.ai：`active=false`，且 `start_time`/`end_time` 为空串、
-  `checkin_dates=[]`、`total_credits=0`、`season=1` —— 活动从未配置。
-  同一站点两个不同账号返回逐字段同构（仅 requestId 不同），说明是站点级差异，
-  不是账号被单独排除。
-- 国内站 www.codebuddy.cn：`active=true`，有真实活动周期与 `season=9`。
+- `POST /v2/billing/meter/checkin-activity-status`：
+  国际站 www.workbuddy.ai 回 `active=false`（`start_time`/`end_time` 为空串、
+  `checkin_dates=[]`、`season=1`）；国内站 www.codebuddy.cn 回 `active=true`
+  且有真实活动周期与 `season=9`。
+- `POST /v2/billing/meter/daily-checkin`（关键旁证）：两个站点都回
+  `400 code=10001`，国际站文案是**「签到活动未开启或已过期」**，
+  国内站同码文案是「今天已签到，请明天再来」。
 
-所以 `active=false` 的正确语义是「无事可做」，而不是「做失败了」。
+即 `active=false` 是**上游的活动开关状态**，与账号、凭证、我们的请求头都无关
+（已用三种 header 变体实测，结果一致）。所以正确语义是「上游未开启」，
+而不是「我们做失败了」——不写进已逝的臆测（如「活动从未配置」）。
+
 处理方式必须是**提示区分**，绝不能绕过上游的活动开关去强行 claim。
 """
 
@@ -142,10 +147,10 @@ def test_inactive_site_is_not_reported_as_failure(isolated_db, monkeypatch):
 
     result = asyncio.run(auth_manager.claim_daily_checkin(db.get_account(aid)))
 
-    assert result["ok"] is True, "站点无活动不该被判为失败"
+    assert result["ok"] is True, "活动未开启不该被判为失败"
     assert result["unavailable"] is True
     assert result["claimed"] is False
-    assert result["message"] == "该站点无签到活动"
+    assert result["message"] == "签到活动未开启或已过期"
     # 关键：不得去戳 daily-checkin，绝不绕过上游活动开关
     assert not any("daily-checkin" in url for url in client.requests), (
         f"active=false 时不应发起领取请求，实际请求了 {client.requests}"
@@ -193,7 +198,7 @@ def test_status_all_excludes_inactive_from_available(isolated_db, monkeypatch):
                 account,
                 ok=True,
                 payload=INTL_INACTIVE_PAYLOAD["data"],
-                message="该站点无签到活动",
+                message="签到活动未开启或已过期",
             )
             row["unavailable"] = True
             return row
@@ -222,7 +227,7 @@ def test_checkin_all_failed_excludes_unavailable(isolated_db, monkeypatch):
             account,
             ok=True,
             payload=INTL_INACTIVE_PAYLOAD["data"],
-            message="该站点无签到活动",
+            message="签到活动未开启或已过期",
         )
         row["unavailable"] = True
         return row
@@ -232,7 +237,7 @@ def test_checkin_all_failed_excludes_unavailable(isolated_db, monkeypatch):
 
     summary = asyncio.run(control_plane.checkin_all())
 
-    assert summary["failed"] == 0, "站点无活动不应显示为失败"
+    assert summary["failed"] == 0, "活动未开启不应显示为失败"
     assert summary["unavailable"] == 1
     assert summary["claimed"] == 0
 

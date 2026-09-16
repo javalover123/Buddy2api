@@ -451,7 +451,7 @@ async def credit_summary(force: bool = False) -> dict:
 
 
 def _checkin_unavailable(row: dict) -> bool:
-    """上游站点没有签到活动（active=false），既不算可领也不算失败。"""
+    """上游判该账号签到「未开启或已过期」（active=false），既不算可领也不算失败。"""
     return bool(row.get("unavailable")) or row.get("active") is False
 
 
@@ -537,7 +537,7 @@ async def checkin_all(channel_filter: list[str] | None = None) -> dict:
         "total": len(results),
         "claimed": sum(1 for row in results if row.get("claimed")),
         "already_claimed": sum(1 for row in results if row.get("already_claimed")),
-        # 站点无活动的账号不计入 failed：它没失败，只是没这个活动可参加。
+        # 上游未开启签到的账号不计入 failed：不是我们失败，是活动开关没开。
         "failed": sum(1 for row in results if not row.get("ok") and not _checkin_unavailable(row)),
         "unavailable": sum(1 for row in results if _checkin_unavailable(row)),
         "credit": wb_credit,
