@@ -834,6 +834,9 @@ def _checkin_result(
         "ok": ok,
         "claimed": claimed,
         "already_claimed": already_claimed,
+        # 上游明确回 active=false 表示「该站点根本没有签到活动」，不是领取失败。
+        # 单独成字段，便于上游汇总把它排除出 failed（见 control_plane.checkin_all）。
+        "unavailable": False,
         "status_code": status_code,
         "message": message,
         "credit": credit,
@@ -1180,8 +1183,11 @@ async def claim_daily_checkin(account: dict) -> dict:
     if not status.get("ok"):
         return status
     if status.get("active") is False:
-        status["ok"] = False
-        status["message"] = "活动当前不可用"
+        # 上游站点没有配置签到活动（国际站实测恒为 active=false，start/end_time 为空）。
+        # 这不是账号故障也不是领取失败，所以 ok 保持 True、只标 unavailable，
+        # 避免「一键领取」把它计进 failed 造成「系统坏了」的误判。
+        status["unavailable"] = True
+        status["message"] = "该站点无签到活动"
         return status
     if status.get("today_checked_in"):
         status["already_claimed"] = True

@@ -450,6 +450,11 @@ async def credit_summary(force: bool = False) -> dict:
     }
 
 
+def _checkin_unavailable(row: dict) -> bool:
+    """上游站点没有签到活动（active=false），既不算可领也不算失败。"""
+    return bool(row.get("unavailable")) or row.get("active") is False
+
+
 async def checkin_status_all(force: bool = False) -> dict:
     results = []
     for channel in providers.enabled_provider_ids():
@@ -481,7 +486,14 @@ async def checkin_status_all(force: bool = False) -> dict:
         "ok": sum(1 for row in results if row.get("ok")),
         "claimed": sum(1 for row in results if row.get("claimed")),
         "already_claimed": sum(1 for row in results if row.get("already_claimed") or row.get("today_checked_in")),
-        "available": sum(1 for row in results if row.get("ok") and not (row.get("already_claimed") or row.get("today_checked_in"))),
+        "available": sum(
+            1
+            for row in results
+            if row.get("ok")
+            and not _checkin_unavailable(row)
+            and not (row.get("already_claimed") or row.get("today_checked_in"))
+        ),
+        "unavailable": sum(1 for row in results if _checkin_unavailable(row)),
         "failed": sum(1 for row in results if not row.get("ok")),
         "stale": sum(1 for row in results if row.get("stale")),
         "results": results,
@@ -525,7 +537,9 @@ async def checkin_all(channel_filter: list[str] | None = None) -> dict:
         "total": len(results),
         "claimed": sum(1 for row in results if row.get("claimed")),
         "already_claimed": sum(1 for row in results if row.get("already_claimed")),
-        "failed": sum(1 for row in results if not row.get("ok")),
+        # 站点无活动的账号不计入 failed：它没失败，只是没这个活动可参加。
+        "failed": sum(1 for row in results if not row.get("ok") and not _checkin_unavailable(row)),
+        "unavailable": sum(1 for row in results if _checkin_unavailable(row)),
         "credit": wb_credit,
         "credit_deprecated": True,
         "skipped": skipped,

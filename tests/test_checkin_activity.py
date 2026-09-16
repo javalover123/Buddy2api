@@ -1,0 +1,257 @@
+"""签到活动语义：`active=false` 是「该站点没有活动」，不是「领取失败」。
+
+回归（2026-09-16）：用户在国际站账号 `xiaoyaoaiqima`（domain=www.workbuddy.ai）
+上点「一键领取今日积分」，弹出「活动当前不可用」并计入 `failed`，看起来像服务故障。
+
+实查上游 `POST /v2/billing/meter/checkin-activity-status` 原始响应（按上面 payload 复刻）：
+
+- 国际站 www.workbuddy.ai：`active=false`，且 `start_time`/`end_time` 为空串、
+  `checkin_dates=[]`、`total_credits=0`、`season=1` —— 活动从未配置。
+  同一站点两个不同账号返回逐字段同构（仅 requestId 不同），说明是站点级差异，
+  不是账号被单独排除。
+- 国内站 www.codebuddy.cn：`active=true`，有真实活动周期与 `season=9`。
+
+所以 `active=false` 的正确语义是「无事可做」，而不是「做失败了」。
+处理方式必须是**提示区分**，绝不能绕过上游的活动开关去强行 claim。
+"""
+
+import asyncio
+
+import pytest
+
+import auth_manager
+import control_plane
+import credential_crypto
+import database as db
+
+INTL_DOMAIN = "www.workbuddy.ai"
+CN_DOMAIN = "www.codebuddy.cn"
+
+# 上游国际站真实响应（2026-09-16 实测复刻）
+INTL_INACTIVE_PAYLOAD = {
+    "code": 0,
+    "msg": "OK",
+    "data": {
+        "active": False,
+        "today_checked_in": False,
+        "streak_days": 0,
+        "daily_credit": 100,
+        "today_credit": 100,
+        "is_streak_day": False,
+        "checkin_dates": [],
+        "week_checkin_days": 0,
+        "total_credits": 0,
+        "start_time": "",
+        "end_time": "",
+        "theme_name": "Buddy 加油站",
+        "season": 1,
+        "activity_name": "本期：专家能量包",
+        "claim_button_text": "立即领取",
+    },
+}
+
+CN_ACTIVE_PAYLOAD = {
+    "code": 0,
+    "msg": "OK",
+    "data": {
+        "active": True,
+        "today_checked_in": False,
+        "streak_days": 1,
+        "daily_credit": 100,
+        "today_credit": 100,
+        "checkin_dates": ["2026-09-16"],
+        "week_checkin_days": 1,
+        "total_credits": 100,
+        "start_time": "2026-09-16 00:00:00",
+        "end_time": "2026-09-29 23:59:59",
+        "theme_name": "Buddy加油站",
+        "season": 9,
+        "activity_name": "高校新生攻略",
+    },
+}
+
+
+@pytest.fixture()
+def isolated_db(tmp_path, monkeypatch):
+    path = tmp_path / "gateway.db"
+    monkeypatch.setattr(db, "DB_PATH", path)
+    monkeypatch.setenv("CB_GATEWAY_MASTER_KEY", "pytest-master-key")
+    credential_crypto.reset_cache()
+    db.init_db()
+    yield path
+    credential_crypto.reset_cache()
+
+
+def _make_account(uid: str = "u1", domain: str = INTL_DOMAIN) -> int:
+    return db.add_account(
+        {
+            "name": uid,
+            "uid": uid,
+            "provider": "workbuddy",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "domain": domain,
+            "status": "active",
+            "expires_at": 4_000_000_000_000,
+        }
+    )
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, response):
+        self._response = response
+        self.requests: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        self.requests.append(url)
+        return self._response
+
+
+def _patch_headers(monkeypatch):
+    async def fake_headers(account):
+        return {"authorization": "Bearer test"}
+
+    monkeypatch.setattr(auth_manager, "get_billing_headers", fake_headers)
+
+
+def test_inactive_site_is_not_reported_as_failure(isolated_db, monkeypatch):
+    """active=false 时 ok 保持 True、标 unavailable，且不发起 claim 请求。"""
+    _patch_headers(monkeypatch)
+    aid = _make_account(domain=INTL_DOMAIN)
+    client = _FakeClient(_FakeResponse(200, INTL_INACTIVE_PAYLOAD))
+
+    def factory(*args, **kwargs):
+        return client
+
+    monkeypatch.setattr(auth_manager.httpx, "AsyncClient", factory)
+
+    result = asyncio.run(auth_manager.claim_daily_checkin(db.get_account(aid)))
+
+    assert result["ok"] is True, "站点无活动不该被判为失败"
+    assert result["unavailable"] is True
+    assert result["claimed"] is False
+    assert result["message"] == "该站点无签到活动"
+    # 关键：不得去戳 daily-checkin，绝不绕过上游活动开关
+    assert not any("daily-checkin" in url for url in client.requests), (
+        f"active=false 时不应发起领取请求，实际请求了 {client.requests}"
+    )
+
+
+def test_active_site_still_claims_normally(isolated_db, monkeypatch):
+    """国内站 active=true 的路径不受影响，仍会真的发起领取。"""
+    _patch_headers(monkeypatch)
+    aid = _make_account(domain=CN_DOMAIN)
+    client = _FakeClient(_FakeResponse(200, CN_ACTIVE_PAYLOAD))
+    client.requests = []
+
+    async def post(url, headers=None, json=None):
+        client.requests.append(url)
+        if "daily-checkin" in url:
+            return _FakeResponse(
+                200,
+                {"code": 0, "msg": "OK", "data": {"credit": 100, "today_checked_in": True}},
+            )
+        return _FakeResponse(200, CN_ACTIVE_PAYLOAD)
+
+    monkeypatch.setattr(client, "post", post)
+
+    def factory(*args, **kwargs):
+        return client
+
+    monkeypatch.setattr(auth_manager.httpx, "AsyncClient", factory)
+
+    result = asyncio.run(auth_manager.claim_daily_checkin(db.get_account(aid)))
+
+    assert any("daily-checkin" in url for url in client.requests)
+    assert result["unavailable"] is False
+    assert result["claimed"] is True
+
+
+def test_status_all_excludes_inactive_from_available(isolated_db, monkeypatch):
+    """无活动账号既不进 available 也不进 failed，单独计 unavailable。"""
+    intl = _make_account(uid="intl-1", domain=INTL_DOMAIN)
+    cn = _make_account(uid="cn-1", domain=CN_DOMAIN)
+
+    async def fake_fetch(account, force=False):
+        if account["domain"] == INTL_DOMAIN:
+            row = auth_manager._checkin_result(
+                account,
+                ok=True,
+                payload=INTL_INACTIVE_PAYLOAD["data"],
+                message="该站点无签到活动",
+            )
+            row["unavailable"] = True
+            return row
+        return auth_manager._checkin_result(
+            account, ok=True, payload=CN_ACTIVE_PAYLOAD["data"], message="OK"
+        )
+
+    monkeypatch.setattr(auth_manager, "fetch_checkin_status", fake_fetch)
+
+    summary = asyncio.run(control_plane.checkin_status_all(force=True))
+    by_id = {row["account_id"]: row for row in summary["results"]}
+
+    assert by_id[intl]["unavailable"] is True
+    assert summary["unavailable"] == 1
+    assert summary["failed"] == 0, "无活动不算失败"
+    assert summary["available"] == 1, "只有国内站账号可领"
+    assert by_id[cn]["unavailable"] is False
+
+
+def test_checkin_all_failed_excludes_unavailable(isolated_db, monkeypatch):
+    """一键领取汇总里，无活动账号不计入 failed，但单独可见。"""
+    _make_account(uid="intl-1", domain=INTL_DOMAIN)
+
+    async def fake_claim(account):
+        row = auth_manager._checkin_result(
+            account,
+            ok=True,
+            payload=INTL_INACTIVE_PAYLOAD["data"],
+            message="该站点无签到活动",
+        )
+        row["unavailable"] = True
+        return row
+
+    monkeypatch.setattr(auth_manager, "claim_daily_checkin", fake_claim)
+    monkeypatch.setattr(control_plane, "checkin_gap_seconds", lambda: 0)
+
+    summary = asyncio.run(control_plane.checkin_all())
+
+    assert summary["failed"] == 0, "站点无活动不应显示为失败"
+    assert summary["unavailable"] == 1
+    assert summary["claimed"] == 0
+
+
+def test_real_failure_still_counts_as_failed(isolated_db, monkeypatch):
+    """真正的失败（如凭证失效）必须仍然计入 failed，别把语义改宽了。"""
+    _make_account(uid="intl-1", domain=INTL_DOMAIN)
+
+    async def fake_claim(account):
+        return auth_manager._checkin_result(
+            account,
+            ok=False,
+            message="token refresh failed or account credentials are invalid",
+        )
+
+    monkeypatch.setattr(auth_manager, "claim_daily_checkin", fake_claim)
+    monkeypatch.setattr(control_plane, "checkin_gap_seconds", lambda: 0)
+
+    summary = asyncio.run(control_plane.checkin_all())
+
+    assert summary["failed"] == 1
+    assert summary["unavailable"] == 0
