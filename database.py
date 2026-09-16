@@ -809,16 +809,92 @@ def api_key_increment_usage(kid: int, tokens: int):
         conn.close()
 
 
+# 选路用的「近期负载」窗口。
+#
+# `accounts.total_requests` 是终身累计值且只增不减，拿它当负载信号会让历史欠债永远
+# 追不平：线上实测两个国际账号水位 1110 / 754，差值远大于粘性容差 1.0，于是「少的
+# 先用」退化成「永远只用计数较低的那个」，看起来就像固定路由到一个账号。窗口只看
+# 最近一段时间内实际接了多少请求，才是真正可均衡、能自我纠正的信号。
+# 15 分钟：足够覆盖一次突发，又短到让空闲账号迅速回到同一水位。
+ROUTE_WINDOW_SECONDS = int(os.environ.get("CB_GATEWAY_ROUTE_WINDOW_SECONDS", "900"))
+
+
+def recent_account_loads(window_seconds: Optional[int] = None) -> dict[int, int]:
+    """各账号在最近 window_seconds 内成功服务的请求数。
+
+    只统计 2xx（真的服务了的），失败/被拒/重打的尝试不算负载：那类请求没有占用上游
+    的生成额度，算进来会让一个正在被上游拒的账号显得「很忙」而被绕开。
+    """
+    window = ROUTE_WINDOW_SECONDS if window_seconds is None else max(0, int(window_seconds))
+    since = int(time.time()) - window
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT account_id, COUNT(*) AS n FROM logs
+            WHERE created_at >= ? AND account_id IS NOT NULL
+              AND status_code BETWEEN 200 AND 299
+            GROUP BY account_id
+            """,
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {int(row["account_id"]): int(row["n"]) for row in rows}
+
+
+def observed_site_costs(window_days: int = 30) -> dict[str, dict[str, dict]]:
+    """从历史请求日志里统计「每个模型在每个站点实际被扣了多少费」。
+
+    同一个模型在两个站点的计费可以完全不同（线上实测 deepseek-v4.1-flash 国际站
+    1750 次全部 credit=0，国内站 497 次里 485 次扣费、累计 167.66），而 glm-5.3
+    反过来在国际站收费。所以「免费」是 (模型 × 站点) 的属性，只能从实测数据里学，
+    不能按站点一刀切。
+
+    返回 {模型: {站点分组: {"requests": n, "paid": k, "credit": 累计扣费}}}。
+    站点分组用 sites.site_group 判定，与路由侧共用同一份定义。
+    """
+    since = int(time.time()) - max(1, int(window_days)) * 86400
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT l.model AS model, a.domain AS domain, l.credit AS credit
+            FROM logs l JOIN accounts a ON a.id = l.account_id
+            WHERE l.created_at >= ? AND l.account_id IS NOT NULL
+              AND l.status_code BETWEEN 200 AND 299
+              AND l.model IS NOT NULL AND l.model != ''
+            """,
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    import sites
+
+    profile: dict[str, dict[str, dict]] = {}
+    for row in rows:
+        model = str(row["model"] or "").strip()
+        if not model:
+            continue
+        group = sites.site_group(row["domain"])
+        credit = float(row["credit"] or 0)
+        bucket = profile.setdefault(model, {}).setdefault(
+            group, {"requests": 0, "paid": 0, "credit": 0.0}
+        )
+        bucket["requests"] += 1
+        bucket["credit"] += credit
+        if credit > 0:
+            bucket["paid"] += 1
+    return profile
+
+
 def reset_account_request_counts() -> int:
-    """把全部账号的请求计数归零，返回受影响行数。
+    """把全部账号的终身请求计数归零，返回受影响行数。
 
-    `total_requests` 是选路依据（排序 key 里的 total_requests/weight），但它只增不减：
-    历史请求多的账号会永远排在后面，结果就是「只有最闲的一两个账号在跑」，负载看起来
-    像固定路由到一个账号。归零是让现有账号重新回到同一水位的唯一办法，也避免为它引入
-    一套滑动窗口统计。
-
-    只动计数，不动 total_tokens / total_credits：那两个是展示用的累计值，归零会把
-    「累计已用」的历史弄丢。
+    选路已改用 `recent_account_loads` 的滑动窗口，不再依赖这个终身累计值，所以归零
+    对路由没有影响 —— 它现在只是「清掉展示用的累计统计」。保留是因为管理页把它当作
+    计数器重置入口；`total_tokens` / `total_credits` 不动，避免弄丢「累计已用」。
     """
     with _lock:
         conn = get_conn()

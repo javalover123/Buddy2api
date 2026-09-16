@@ -1,13 +1,15 @@
 """按模型配置站点偏好。
 
-同一个模型在国内站与国际站的计费不同（实测 deepseek-v4.1-flash 国际站免费、
-国内站扣额度），所以「优先用哪边的账号」必须能按模型配置，不能写死在选号逻辑里。
+同一个模型在国内站与国际站的计费不同（实测 deepseek-v4.1-flash 国际站 1750 次全部
+免费、国内站 497 次里 485 次扣费累计 167.66；而 glm-5.3 反过来国际站收费），所以
+「优先用哪边的账号」必须能按模型配置，不能写死在选号逻辑里。
 
 设置存在 `settings.model_site_preference`：
 
-    {"default": "international", "models": {"deepseek-v4.1-flash": "international"}}
+    {"default": "auto", "models": {"deepseek-v4.1-flash": "international"}}
 
-两组取值是 `sites.SITE_GROUPS`（international / domestic）；模型值为空串表示该模型
+取值是 `sites.SITE_PREFERENCE_CHOICES`：两个具体站点、或 `auto`（从实测计费里学
+哪边免费/更便宜，见 `auth_manager._auto_site_preference`）。模型值为空串表示该模型
 不区分站点。`default` 只作用于没有单独配置的模型。
 
 路由侧只把它当优先级用（见 `auth_manager.pick_account`）：偏好站点有可用账号就先用，
@@ -56,15 +58,15 @@ def _site(value, field: str) -> str:
     text = str(value or "").strip().lower()
     if text == "":
         return ""
-    if text not in sites.SITE_GROUPS:
+    if text not in sites.SITE_PREFERENCE_CHOICES:
         raise SitePreferenceError(
-            f"{field} must be one of: {', '.join(sites.SITE_GROUPS)} (or empty)"
+            f"{field} must be one of: {', '.join(sites.SITE_PREFERENCE_CHOICES)} (or empty)"
         )
     return text
 
 
 def snapshot() -> dict:
-    """给管理页用：当前生效的偏好 + 可选值。"""
+    """给管理页用：当前生效的偏好 + 可选值 + 实测计费画像。"""
     import auth_manager
 
     current = auth_manager.model_site_preference()
@@ -72,4 +74,6 @@ def snapshot() -> dict:
         "default": current["default"],
         "models": current["models"],
         "site_groups": list(sites.SITE_GROUPS),
+        "auto": sites.SITE_AUTO,
+        "cost_profile": auth_manager.cost_profile(),
     }

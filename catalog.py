@@ -240,6 +240,24 @@ async def _pick_account(provider) -> dict | None:
     return await picker()
 
 
+async def _catalog_accounts(provider) -> list[dict]:
+    """刷新目录时采样哪些账号。
+
+    默认只取一个（与历史行为一致）。通道可以覆盖成「全部活跃账号」—— 国内站与国际站
+    的模型集几乎不重叠，只采样一个账号会让另一个站的模型整体从 /v1/models 里消失，
+    客户端也就再也请求不到它们了。
+    """
+    if provider is None:
+        return []
+    hook = getattr(provider, "catalog_accounts", None)
+    if hook is not None:
+        accounts = [a for a in await hook() if isinstance(a, dict)]
+        if accounts:
+            return accounts
+    account = await _pick_account(provider)
+    return [account] if account else []
+
+
 async def _fetch_qclaw(account: dict) -> list[dict]:
     from providers.qclaw.jprx import fetch_supplier_models
 
@@ -287,8 +305,8 @@ async def refresh_one(channel: str) -> dict:
             message="no supplier-list API",
             display_name=display_name,
         )
-    account = await _pick_account(provider)
-    if not account:
+    accounts = await _catalog_accounts(provider)
+    if not accounts:
         return _status_row(
             channel,
             mode="fallback",
@@ -296,22 +314,30 @@ async def refresh_one(channel: str) -> dict:
             message="no usable account",
             display_name=display_name,
         )
-    try:
-        fetched = normalize_models(await fetcher(account))
-    except Exception as exc:
-        return _status_row(
-            channel,
-            mode="fallback",
-            models=fallback,
-            message=str(exc)[:240],
-            display_name=display_name,
-        )
+
+    fetched: list[dict] = []
+    failures: list[str] = []
+    for account in accounts:
+        try:
+            account_models = normalize_models(await fetcher(account))
+        except Exception as exc:
+            failures.append(str(exc)[:120])
+            continue
+        if not account_models:
+            continue
+        # 把「这个账号能服务哪些模型」写回路由层：混装国内/国际账号时，这是把请求
+        # 发给正确账号的唯一依据（模型目录本身是并集，看不出账号差异）。
+        record = getattr(provider, "record_account_models", None)
+        if record is not None:
+            record(account, [item["id"] for item in account_models])
+        fetched = _merge_models(fetched, account_models)
+
     if not fetched:
         return _status_row(
             channel,
             mode="fallback",
             models=fallback,
-            message="empty supplier list",
+            message="; ".join(failures)[:240] or "empty supplier list",
             display_name=display_name,
         )
     save_catalog(channel, fetched)

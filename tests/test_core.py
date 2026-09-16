@@ -460,7 +460,7 @@ def _collect_chat_proxy_stream(
 
     account = {"id": 1, "name": "test-account"}
 
-    async def pick_account(_excluded):
+    async def pick_account(_excluded, model=None):
         return account
 
     async def valid_headers(_account):
@@ -552,7 +552,7 @@ def _install_chat_account_stream_fakes(
             account_id = int(headers["X-Test-Account"])
             return FakeResponse(streams[account_id])
 
-    async def pick_account(excluded):
+    async def pick_account(excluded, model=None):
         calls["picks"].append(set(excluded))
         return next((account for account in accounts if account["id"] not in excluded), None)
 
@@ -583,6 +583,141 @@ def _install_chat_account_stream_fakes(
     monkeypatch.setattr(proxy, "_log_request", record_log)
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
     return calls
+
+
+def _install_sequenced_stream_fakes(monkeypatch, streams: list[list[bytes]]) -> dict:
+    """按调用顺序返回不同的上游流，并记录请求体与「实际被消费的上游分片」。
+
+    `calls["consumed"][i]` 是第 i 次请求里网关真正从上游拉走的分片列表 ——
+    用它区分「边收边转发」和「整段收完再吐」：前者在网关吐出第一个正文增量时，
+    上游一定还没被读完。
+    """
+    calls = {"bodies": [], "consumed": []}
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, chunks, sink):
+            self.chunks = chunks
+            self.sink = sink
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def aiter_bytes(self):
+            for chunk in self.chunks:
+                self.sink.append(chunk)
+                yield chunk
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def stream(self, *args, json=None, **kwargs):
+            calls["bodies"].append(json)
+            sink: list[bytes] = []
+            calls["consumed"].append(sink)
+            index = min(len(calls["bodies"]) - 1, len(streams) - 1)
+            return FakeResponse(streams[index], sink)
+
+    account = {"id": 1, "name": "test-account"}
+
+    async def pick_account(excluded, model=None):
+        return account
+
+    async def valid_headers(_account):
+        return {"Authorization": "Bearer test"}
+
+    monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
+    monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
+    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id: None)
+    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
+    monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
+    monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
+    monkeypatch.setattr(proxy, "_log_request", lambda *_a, **_k: None)
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
+    return calls
+
+
+def _role_stream_chunk() -> bytes:
+    """真实上游的第一个增量：只带 role，没有正文。"""
+    return _chat_sse({
+        "id": "c0", "object": "chat.completion.chunk", "created": 0,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    })
+
+
+def _tool_call_stream_chunks() -> list[bytes]:
+    """上游流：直接给出工具调用。"""
+    return [
+        _role_stream_chunk(),
+        _chat_sse({
+            "id": "c2", "object": "chat.completion.chunk", "created": 2,
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "t1", "type": "function",
+                 "function": {"name": "list_files", "arguments": "{}"}}]},
+                "finish_reason": None}],
+        }),
+        _chat_sse({
+            "id": "c2", "object": "chat.completion.chunk", "created": 2,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        }),
+        b"data: [DONE]\n\n",
+    ]
+
+
+def _content_stream_chunks(text: str, *, reasoning: str | None = None, piece: int = 80) -> list[bytes]:
+    """上游流：正文（可选先给一段推理）按小分片下发，最后 finish_reason=stop。"""
+    chunks = [_role_stream_chunk()]
+    if reasoning is not None:
+        for start in range(0, len(reasoning), piece):
+            chunks.append(_chat_sse({
+                "id": "c3", "object": "chat.completion.chunk", "created": 3,
+                "choices": [{"index": 0,
+                             "delta": {"reasoning_content": reasoning[start:start + piece]},
+                             "finish_reason": None}],
+            }))
+    for start in range(0, len(text), piece):
+        chunks.append(_chat_sse({
+            "id": "c3", "object": "chat.completion.chunk", "created": 3,
+            "choices": [{"index": 0, "delta": {"content": text[start:start + piece]},
+                         "finish_reason": None}],
+        }))
+    chunks.append(_chat_sse({
+        "id": "c3", "object": "chat.completion.chunk", "created": 3,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }))
+    chunks.append(b"data: [DONE]\n\n")
+    return chunks
+
+
+def _pull_until(gen, marker: bytes, limit: int = 500) -> list[bytes]:
+    """从异步生成器里逐个取事件，直到某个事件包含 marker（或耗尽）。"""
+    async def run():
+        seen: list[bytes] = []
+        try:
+            for _ in range(limit):
+                try:
+                    event = await gen.__anext__()
+                except StopAsyncIteration:
+                    break
+                seen.append(event)
+                if marker in event:
+                    break
+        finally:
+            await gen.aclose()
+        return seen
+
+    return asyncio.run(run())
 
 
 @pytest.fixture()
@@ -3023,7 +3158,7 @@ def test_non_stream_proxy_fails_over_on_retryable_upstream(isolated_db, monkeypa
     account = db.get_account(account_id)
     calls = []
 
-    async def pick(exclude):
+    async def pick(exclude, model=None):
         calls.append("pick")
         return account
 
@@ -3204,7 +3339,7 @@ def test_stall_retry_nonstream_uses_tool_call_result(monkeypatch, isolated_db):
 
     account = {"id": 1, "name": "test-account"}
 
-    async def pick_account(_excluded):
+    async def pick_account(_excluded, model=None):
         return account
 
     async def valid_headers(_account):
@@ -3254,7 +3389,7 @@ def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkey
 
     account = {"id": 1, "name": "test-account"}
 
-    async def pick_account(_excluded):
+    async def pick_account(_excluded, model=None):
         return account
 
     async def valid_headers(_account):
@@ -3283,45 +3418,13 @@ def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkey
     assert calls == [None, "required"]
 
 
-def test_stream_tool_loop_retries_stall_like_nonstream(monkeypatch, isolated_db):
-    stall_json = {
-        "id": "c1", "object": "chat.completion", "created": 1,
-        "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Let me continue."},
-                     "finish_reason": "stop"}],
-        "usage": {},
-    }
-    fixed_json = {
-        "id": "c2", "object": "chat.completion", "created": 2,
-        "model": "auto",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "t1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]},
-                     "finish_reason": "tool_calls"}],
-        "usage": {},
-    }
-    calls = []
-    account = {"id": 1, "name": "test-account"}
-
-    async def pick_account(_excluded):
-        return account
-
-    async def valid_headers(_account):
-        return {"Authorization": "Bearer test"}
-
-    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
-        calls.append(body.get("tool_choice"))
-        if len(calls) == 1:
-            return ("json", stall_json)
-        return ("json", fixed_json)
-
-    monkeypatch.setattr(proxy, "_collect_stream", fake_collect)
-    monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
-    monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
-    monkeypatch.setattr(auth_manager, "mark_account_success", lambda _id: None)
-    monkeypatch.setattr(auth_manager, "mark_account_failure", lambda *_a: None)
-    monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://upstream.test")
-    monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
-
+def test_stream_tool_loop_retries_stall_and_hides_stalled_text(monkeypatch, isolated_db):
+    """流式工具回合停转 → 用 tool_choice=required 重打；停转那次的正文不能漏给客户端。"""
+    monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
+    calls = _install_sequenced_stream_fakes(
+        monkeypatch,
+        [_stall_stream_chunks(), _tool_call_stream_chunks()],
+    )
     body = _tool_loop_body()
     body["stream"] = True
 
@@ -3333,7 +3436,14 @@ def test_stream_tool_loop_retries_stall_like_nonstream(monkeypatch, isolated_db)
     raw = asyncio.run(run())
     payloads, done_count = _parse_chat_proxy_sse(raw)
     assert done_count == 1
-    assert calls == [None, "required"]
+    assert [sent.get("tool_choice") for sent in calls["bodies"]] == [None, "required"]
+    assert "好的，马上继续跑流程。".encode() not in raw
+    # 被丢弃那一轮不能留下正文或终止事件（无正文的 role 增量会透传，客户端按 role 合并即可）
+    terminal = [
+        p for p in payloads if (p.get("choices") or [{}])[0].get("finish_reason")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["choices"][0]["finish_reason"] == "tool_calls"
     assert any(
         (p.get("choices") or [{}])[0].get("delta", {}).get("tool_calls")
         for p in payloads
@@ -3344,9 +3454,123 @@ def test_stream_tool_loop_retries_stall_like_nonstream(monkeypatch, isolated_db)
     )
 
 
+def test_stream_tool_loop_stall_retry_then_fail_stream(monkeypatch, isolated_db):
+    """重打仍停转 + CB_GATEWAY_TOOL_STALL_FAIL_STREAM=1 → 把回合标记为失败，让客户端自己重试。
+
+    这条路径要和「重打」区分开：正文已扣留时第一轮不报错（要留着重打），
+    只有重打那一轮（正文直通、无法回退）才允许发失败事件。
+    """
+    monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
+    monkeypatch.setattr(proxy, "TOOL_STALL_FAIL_STREAM", True)
+    calls = _install_sequenced_stream_fakes(
+        monkeypatch,
+        [_stall_stream_chunks(), _stall_stream_chunks()],
+    )
+    body = _tool_loop_body()
+    body["stream"] = True
+
+    async def run():
+        return b"".join([
+            chunk
+            async for chunk in proxy._stream_with_stall_guard(body, None, "test-model")
+        ])
+
+    raw = asyncio.run(run())
+    payloads, done_count = _parse_chat_proxy_sse(raw)
+    assert done_count == 1
+    errors = [p for p in payloads if p.get("error")]
+    assert len(errors) == 1
+    assert errors[0]["error"]["code"] == "upstream_tool_stall"
+    assert [sent.get("tool_choice") for sent in calls["bodies"]] == [None, "required"]
+
+
+def test_stream_tool_loop_streams_long_answer_without_buffering(monkeypatch, isolated_db):
+    """正文超过停转阈值 → 边收边转发（不是整段收完再吐），也不重打。"""
+    monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
+    chunks = _content_stream_chunks("这是一段足够长的正文。" * 80)
+    calls = _install_sequenced_stream_fakes(monkeypatch, [chunks])
+    body = _tool_loop_body()
+    body["stream"] = True
+
+    seen = _pull_until(
+        proxy._stream_with_stall_guard(body, None, "test-model"), b'"content"'
+    )
+    assert seen, "应该已经吐出正文增量"
+    assert len(calls["consumed"][0]) < len(chunks), "不该在吐正文前把上游整段读完"
+    assert len(calls["bodies"]) == 1
+
+
+def test_stream_tool_loop_passes_reasoning_through_immediately(monkeypatch, isolated_db):
+    """推理内容不被扣留：正文还在等阈值时，reasoning_content 已经下发了。"""
+    monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
+    chunks = _content_stream_chunks("短答案。", reasoning="先想一下这个问题。" * 20)
+    calls = _install_sequenced_stream_fakes(monkeypatch, [chunks])
+    body = _tool_loop_body()
+    body["stream"] = True
+
+    seen = _pull_until(
+        proxy._stream_with_stall_guard(body, None, "test-model"), b'"reasoning_content"'
+    )
+    assert seen
+    assert b'"reasoning_content"' in seen[-1]
+    assert len(calls["consumed"][0]) <= 2, "推理增量应当立刻透传"
+
+
+def test_stream_tool_loop_flushes_short_summary_answer(monkeypatch, isolated_db):
+    """短但明确的总结类回答不算停转：正文必须原样下发，不能丢，也不重打。"""
+    monkeypatch.setattr(proxy, "TOOL_STALL_RETRY", True)
+    text = "任务完成，总结如下：共处理 3 个文件。"
+    calls = _install_sequenced_stream_fakes(monkeypatch, [_content_stream_chunks(text)])
+    body = _tool_loop_body()
+    body["stream"] = True
+
+    async def run():
+        return b"".join([
+            chunk
+            async for chunk in proxy._stream_with_stall_guard(body, None, "test-model")
+        ])
+
+    raw = asyncio.run(run())
+    assert text.encode() in raw
+    assert len(calls["bodies"]) == 1
+
+
+def test_content_hold_release_flush_drop():
+    """_ContentHold 的三种出口：超阈值放行 / 遇工具调用放行 / 重打前丢弃。"""
+    hold = proxy._ContentHold(limit=10)
+    assert hold.feed(b"a", 4, False) == []
+    assert hold.feed(b"b", 4, False) == []
+    assert not hold.released
+    assert hold.feed(b"c", 4, False) == [b"a", b"b", b"c"]
+    assert hold.released
+    assert hold.feed(b"d", 0, False) == [b"d"]
+
+    tool_call_hold = proxy._ContentHold(limit=10)
+    assert tool_call_hold.feed(b"x", 1, False) == []
+    assert tool_call_hold.feed(b"y", 1, True) == [b"x", b"y"]
+
+    dropped = proxy._ContentHold(limit=10)
+    dropped.feed(b"z", 1, False)
+    dropped.drop()
+    assert dropped.flush() == []
+
+
+def test_content_hold_passes_through_non_content_events():
+    """不带正文的增量（首包 role / 纯 reasoning）立即透传；缓冲非空时必须排队保序。"""
+    hold = proxy._ContentHold(limit=10)
+    assert hold.feed(b"role", 0, False) == [b"role"]
+    assert hold.feed(b"think", 0, False) == [b"think"]
+
+    ordered = proxy._ContentHold(limit=10)
+    assert ordered.feed(b"body", 5, False) == [], "正文进入扣留"
+    assert ordered.feed(b"think", 0, False) == [], "缓冲非空时后到的增量必须排队"
+    assert ordered.feed(b"more", 11, False) == [b"body", b"think", b"more"]
+
+
 def _stall_stream_chunks() -> list[bytes]:
     """上游流：纯文本增量 + finish_reason=stop（无任何工具调用）。"""
     return [
+        _role_stream_chunk(),
         _chat_sse({
             "id": "c1", "object": "chat.completion.chunk", "created": 1,
             "choices": [{"index": 0, "delta": {"content": "好的，马上继续跑流程。"}, "finish_reason": None}],

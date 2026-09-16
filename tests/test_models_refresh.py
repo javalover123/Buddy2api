@@ -311,9 +311,17 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
     assert any("/api/remote/v1/models" in url for method, url in requested if method == "GET")
     assert any("/api/v2/model/list" in url for method, url in requested if method == "GET")
     assert any("/v2/enterprises/personal/models" in url for method, url in requested if method == "GET")
-    copilot_urls = [url for _, url in requested if "copilot.tencent.com" in url]
-    assert copilot_urls
-    assert all("/v2/enterprises/personal/models" in url for url in copilot_urls)
+    # workbuddy 通道的模型列表请求打的是「账号自己的站点」：
+    # 种子账号没写 domain，add_account 会填 DB 默认值 www.codebuddy.cn，
+    # 而 codebuddy.cn 与 workbuddy.cn 一样是真实的国内站点（见 auth_manager.backend_url_for）。
+    # 因此这里接受该国内域名或全局回退域名 copilot.tencent.com。
+    wb_backend_urls = [
+        url
+        for _, url in requested
+        if "copilot.tencent.com" in url or "www.codebuddy.cn" in url
+    ]
+    assert wb_backend_urls
+    assert all("/v2/enterprises/personal/models" in url for url in wb_backend_urls)
 
     assert QCLAW_NEW_ID in _ids(qclaw.list_models())
     assert TRAE_NEW_DOUBAO in _ids(traework.list_models())

@@ -55,10 +55,47 @@ AUTH_FAILURE_THRESHOLD = 3
 # 站点偏好：settings.model_site_preference = {"default": <站点>, "models": {模型: <站点>}}。
 # 同一个模型在国内站与国际站的计费不同（实测 deepseek-v4.1-flash 国际站免费、国内站
 # 扣额度），所以「优先用哪边的账号」只能按模型配置，不能在选号逻辑里写死。
-# 默认不区分（空串）：没配置过的用户路由行为完全不变，不会因为引入这个设置而把某一边
-# 的账号静默降级。
+#
+# "auto" 是特殊的默认值：不写死站点，而是从历史请求日志里学「哪个站点对这个模型免费/
+# 更便宜」再优先用那一边（见 `_auto_site_preference`）。用户不用手工查价，也不用为每个
+# 模型维护一条配置。未配置时默认值就是 auto，因为「优先用不花钱的那边」不会让任何
+# 账号被错误降级 —— 它仍然只是优先级，学不到结论时不区分站点。
 SITE_PREFERENCE_SETTING = "model_site_preference"
-SITE_PREFERENCE_DEFAULT = ""
+# "auto"：不写死站点，从实测计费里学「哪边免费/更便宜」再优先（见 _auto_site_preference）。
+# 取值定义在 sites.py，写入侧（site_preference.py）与本文件共用同一份。
+SITE_PREFERENCE_AUTO = sites.SITE_AUTO
+SITE_PREFERENCE_DEFAULT = SITE_PREFERENCE_AUTO
+# 自动模式要求多少样本才下结论：太少不足以判断计费，宁可先不区分站点。
+SITE_AUTO_MIN_REQUESTS = 5
+
+# observed_site_costs 每次调用要扫 30 天日志（实测 1.9ms），不能放在每次请求的热路径上。
+_cost_profile_lock = threading.Lock()
+_cost_profile_cache: tuple[float, dict] = (0.0, {})
+COST_PROFILE_TTL = 60.0
+
+
+def cost_profile() -> dict:
+    """带缓存的站点计费画像（见 db.observed_site_costs）。"""
+    global _cost_profile_cache
+    now = time.monotonic()
+    with _cost_profile_lock:
+        stamp, cached = _cost_profile_cache
+        if cached and now - stamp < COST_PROFILE_TTL:
+            return cached
+    try:
+        fresh = db.observed_site_costs()
+    except Exception:
+        return {}
+    with _cost_profile_lock:
+        _cost_profile_cache = (now, fresh)
+    return fresh
+
+
+def forget_cost_profile() -> None:
+    """清掉计费画像缓存（测试与手工调参用）。"""
+    global _cost_profile_cache
+    with _cost_profile_lock:
+        _cost_profile_cache = (0.0, {})
 
 
 def _get_token_lock(aid: int) -> asyncio.Lock:
@@ -104,8 +141,10 @@ def auth_failure_threshold() -> int:
 
 
 def _clean_site(value) -> str:
-    """只接受 sites.SITE_GROUPS 里的值；其余（含空串）视为「不区分」。"""
+    """只接受 sites.SITE_GROUPS 里的值；"auto" 原样保留；其余视为「不区分」。"""
     text = str(value or "").strip().lower()
+    if text == SITE_PREFERENCE_AUTO:
+        return text
     return text if text in sites.SITE_GROUPS else ""
 
 
@@ -134,17 +173,54 @@ def model_site_preference() -> dict:
     return {"default": _clean_site(default), "models": clean}
 
 
+def _auto_site_preference(model: str) -> str:
+    """自动模式：从实测计费里挑「不花钱 / 更便宜」的那个站点。
+
+    同一个模型在两个站点的计费可以完全不同（deepseek-v4.1-flash 国际站免费、国内站
+    扣额度；glm-5.3 反过来国际站收费），而「免费」是 (模型 × 站点) 的属性，模型目录里
+    也没有价格字段，所以只能从历史请求日志里学。
+
+    判定顺序：
+      1. 只看收过费的次数，不收钱的那边优先（完全免费是最优解）；
+      2. 两边都收钱 → 按平均单次扣费取低（就是你说的「收费低」）；
+      3. 一边免费一边收费 → 免费那边；
+      4. 样本不足（SITE_AUTO_MIN_REQUESTS）→ 不区分站点，先让路由自己探索。
+    返回空串表示不区分。
+    """
+    by_site = cost_profile().get(model) or {}
+    scored = []
+    for group in sites.SITE_GROUPS:
+        stats = by_site.get(group) or {}
+        requests = int(stats.get("requests") or 0)
+        if requests < SITE_AUTO_MIN_REQUESTS:
+            continue
+        credit = float(stats.get("credit") or 0)
+        scored.append((group, int(stats.get("paid") or 0), credit / requests))
+    if len(scored) < 2:
+        return ""
+    # 先比「收过费的次数」（0 = 完全免费），再比平均单次扣费
+    scored.sort(key=lambda item: (item[1], item[2]))
+    best, worst = scored[0], scored[-1]
+    # 两边计费表现一样时不必偏向任何一边，保持不区分（负载才能摊平）
+    if (best[1], best[2]) == (worst[1], worst[2]):
+        return ""
+    return best[0]
+
+
 def preferred_site_for(model: Optional[str]) -> str:
     """该模型优先用哪一组站点的账号。返回空串表示不区分站点。
 
     只影响优先级、不会排除账号：偏好站点没账号或都被试过时，`pick_account` 会退回
     全部候选，不会退化成「明明有账号却报无可用账号」。
+
+    值为 "auto" 时按实测计费自动选（见 `_auto_site_preference`）。
     """
     preference = model_site_preference()
     mid = str(model or "").strip()
-    if mid and mid in preference["models"]:
-        return preference["models"][mid]
-    return preference["default"]
+    chosen = preference["models"][mid] if mid and mid in preference["models"] else preference["default"]
+    if chosen == SITE_PREFERENCE_AUTO:
+        return _auto_site_preference(mid) if mid else ""
+    return chosen
 
 
 def _bump_auth_failure(aid: int) -> int:
@@ -1230,19 +1306,26 @@ def _route_weight(account: dict) -> int:
     return max(1, _route_int(account.get("weight"), 1))
 
 
-def _route_load(account: dict) -> float:
-    """按权重归一后的请求数，越小越空闲。"""
-    return _route_int(account.get("total_requests"), 0) / _route_weight(account)
+def _route_load(account: dict, loads: Optional[dict[int, int]] = None) -> float:
+    """按权重归一后的负载，越小越空闲。
+
+    loads 是 db.recent_account_loads() 的近期窗口计数（选路用）。没传时回退到
+    accounts.total_requests —— 那个终身累计值只用于展示/兼容，拿它做负载信号会让
+    历史欠债永远追不平（见 db.ROUTE_WINDOW_SECONDS 的注释）。
+    """
+    if loads is None:
+        count = _route_int(account.get("total_requests"), 0)
+    else:
+        count = int(loads.get(_route_int(account.get("id"), 0), 0))
+    return count / _route_weight(account)
 
 
-def _route_sort_key(account: dict):
+def _route_sort_key(account: dict, loads: Optional[dict[int, int]] = None):
     weight = _route_weight(account)
-    total_requests = _route_int(account.get("total_requests"), 0)
     return (
         -_route_priority(account),
         -weight,
-        _route_load(account),
-        total_requests,
+        _route_load(account, loads),
         _route_int(account.get("id"), 0),
     )
 
@@ -1264,14 +1347,18 @@ def _set_sticky_account(aid: int, provider: str = "workbuddy", model: Optional[s
         _sticky_account_id[_sticky_key(provider, model)] = aid
 
 
-def _sticky_overloaded(sticky: dict, chosen: dict) -> bool:
+def _sticky_overloaded(
+    sticky: dict,
+    chosen: dict,
+    loads: Optional[dict[int, int]] = None,
+) -> bool:
     """粘住的账号是否已经明显比同级最空闲的账号更累。
 
     容差是常量而不是按账号权重放大：权重只影响「多少请求算一个负载单位」，
     若再拿权重当容差，高权重账号会被允许领先过多，均衡就失去意义了。
     没有容差则会在两个账号之间来回抖动。
     """
-    return _route_load(sticky) > _route_load(chosen) + _STICKY_LOAD_SLACK
+    return _route_load(sticky, loads) > _route_load(chosen, loads) + _STICKY_LOAD_SLACK
 
 
 def pick_account(
@@ -1284,6 +1371,10 @@ def pick_account(
     优先级越高越先用；同优先级下先按「能不能服务这个模型」过滤，再按站点偏好过滤，
     最后尽量粘住该模型上次用的账号（保住 prompt cache）。粘性只在没有明显跑偏时
     保留：粘住的账号比同级最空闲的账号多干了不少活就让位，避免长期只压一个账号。
+
+    负载看的是「最近 ROUTE_WINDOW_SECONDS 内实际服务了多少请求」，不是 accounts 表里
+    的终身累计计数 —— 后者只增不减，历史欠债会让「少的先用」退化成「永远只用计数
+    最低的那个」，看起来就像固定路由到一个账号。
 
     两道过滤都只调整优先级、不清空候选（能力过滤在有能力账号时生效，站点偏好在偏好
     站点有账号时生效），否则会出现「明明有账号，却报 No available accounts」。
@@ -1313,13 +1404,14 @@ def pick_account(
 
     highest_priority = max(_route_priority(a) for a in candidates)
     top_candidates = [a for a in candidates if _route_priority(a) == highest_priority]
-    chosen = sorted(top_candidates, key=_route_sort_key)[0]
+    loads = db.recent_account_loads()
+    chosen = sorted(top_candidates, key=lambda a: _route_sort_key(a, loads))[0]
     key = _sticky_key(provider, model)
     with _route_lock:
         sticky_id = _sticky_account_id.get(key)
         if sticky_id is not None:
             sticky = next((a for a in top_candidates if a["id"] == sticky_id), None)
-            if sticky is not None and not _sticky_overloaded(sticky, chosen):
+            if sticky is not None and not _sticky_overloaded(sticky, chosen, loads):
                 return sticky
         _sticky_account_id[key] = chosen["id"]
         return chosen

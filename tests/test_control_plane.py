@@ -86,6 +86,34 @@ def test_discover_marks_docker_host_auth_limited(isolated_db, monkeypatch):
     assert workbuddy["runtime"]["host_auth_limited"] is False
 
 
+def test_discover_auth_dirs_always_report_readable(isolated_db, tmp_path, monkeypatch):
+    """可读目录也必须带 readable=True，不能只在读不到时才输出该字段。
+
+    前端是按 `d.readable ? ... : ...` 取值的：字段缺失时 undefined 为假，
+    会把正常可读的扫描目录误显示成红色「无权限」。
+    """
+    readable_dir = tmp_path / "ok"
+    readable_dir.mkdir()
+    blocked_dir = tmp_path / "blocked"
+    blocked_dir.mkdir()
+
+    monkeypatch.setattr(auth_manager, "candidate_auth_dirs", lambda auth_dir=None: [readable_dir])
+    dirs = {d["path"]: d for d in auth_manager.discover_auth_files()["dirs"]}
+    assert dirs[str(readable_dir)]["exists"] is True
+    assert dirs[str(readable_dir)]["readable"] is True
+
+    real_state = auth_manager._dir_state
+    monkeypatch.setattr(auth_manager, "candidate_auth_dirs", lambda auth_dir=None: [blocked_dir])
+    monkeypatch.setattr(
+        auth_manager,
+        "_dir_state",
+        lambda p: "unreadable" if p == blocked_dir else real_state(p),
+    )
+    dirs = {d["path"]: d for d in auth_manager.discover_auth_files()["dirs"]}
+    assert dirs[str(blocked_dir)]["exists"] is True
+    assert dirs[str(blocked_dir)]["readable"] is False
+
+
 def test_credit_summary_has_null_total(isolated_db):
     payload = asyncio.run(control_plane.credit_summary())
     assert payload["total_balance"] is None

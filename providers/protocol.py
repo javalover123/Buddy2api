@@ -107,8 +107,14 @@ class Provider(Protocol):
     def pick_account(self, exclude_ids: set[int] | None = None) -> dict | None: ...
 
     async def pick_account_with_fallback(
-        self, exclude_ids: set[int] | None = None
+        self, exclude_ids: set[int] | None = None, model: str | None = None
     ) -> dict | None: ...
+
+    # 以下两个是可选的目录/路由扩展，用 getattr 探测，通道可以不实现：
+    #   catalog_accounts()          刷新模型目录时采样哪些账号（默认只采一个）
+    #   record_account_models(a, m) 把账号的模型能力写回路由层，供按模型过滤候选账号
+    # WorkBuddy 通道实现了它们：国内站与国际站的模型集几乎不重叠，必须多账号采样
+    # 并按模型选号，否则混装账号时请求会打到服务不了该模型的账号上。
 
     async def has_usable_account(self) -> bool: ...
 

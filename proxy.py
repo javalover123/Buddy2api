@@ -128,8 +128,106 @@ def _is_tool_stall(body: dict, finish_reason, tool_calls: bool, text: str) -> bo
     return _looks_like_stall_text(text)
 
 
+def _event_content_chars(payload: dict) -> int:
+    """本次 chunk 里正文（content）新增的字符数 —— 停转判定只看正文。"""
+    total = 0
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+            total += len(delta["content"])
+    return total
+
+
+def _event_has_tool_calls(payload: dict) -> bool:
+    """本次 chunk 是否带工具调用增量 —— 带了就说明不是停转。"""
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if isinstance(delta, dict) and delta.get("tool_calls"):
+            return True
+    return False
+
+
+class _ContentHold:
+    """工具回合的「正文扣留」缓冲。
+
+    工具回合需要保留「模型停转时整轮重打」的能力（用 tool_choice=required 再问一次），
+    而已经下发给客户端的字节收不回来。早期的做法是把上游整段响应收完再吐，代价是
+    工具回合全程没有流式输出 —— 实测单轮静默 6~186 秒，客户端一个字都收不到。
+
+    这里只扣住「有可能需要重打」的窗口：正文累计超过停转阈值就 flush 并转直通。
+    停转判定只看正文（见 _is_tool_stall），不看 reasoning_content，所以推理内容始终
+    即时下发 —— 客户端至少能立刻看到思考过程，而不是干等。
+
+    阈值用原始字符数近似 _looks_like_stall_text 里「去空白后的长度」：可能极少数
+    情况下提前放行（正文含大量空白），后果只是这一轮不再重打、原样透传，不会误伤。
+    """
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.events: list[bytes] = []
+        self.chars = 0
+        self.released = False
+
+    def feed(self, encoded: bytes, content_chars: int, has_tool_calls: bool) -> list[bytes]:
+        """返回需要立刻下发的字节；仍在扣留时返回空列表。
+
+        与正文无关的增量（典型是首包的 role、以及纯 reasoning_content）立即透传 ——
+        推理内容即时下发是这个实现的关键收益，不能被扣留。只有在缓冲为空时才敢这么做，
+        否则会打乱与已扣留正文的相对顺序。
+
+        代价：一旦这一轮被判停转并重打，客户端会先收到一个多余的 role 增量。它不带
+        正文也不带终止事件，客户端按 role 合并即可，属于可接受的噪声。
+        """
+        if self.released:
+            return [encoded]
+        if not self.events and not content_chars and not has_tool_calls:
+            return [encoded]
+        self.events.append(encoded)
+        self.chars += content_chars
+        if has_tool_calls or self.chars > self.limit:
+            return self.flush()
+        return []
+
+    def flush(self) -> list[bytes]:
+        """把扣留的事件全部下发，之后转直通。"""
+        self.released = True
+        pending, self.events = self.events, []
+        return pending
+
+    def drop(self) -> None:
+        """丢弃扣留的事件（这一轮要重打，客户端不该看到它）。"""
+        self.released = True
+        self.events = []
+
+
 def _is_retryable_status(status: int) -> bool:
     return status in RETRYABLE_STATUS_CODES or status in {401, 403}
+
+
+# 上游说「这个模型在你这个账号上不可用」时返回的业务码。
+# 实测两种文案，都是 HTTP 400：
+#   model [default-model] service info not found          （这个站根本没有该模型）
+#   model [gpt-5.6-sol] is only available for authorized users （有该模型但本账号无权）
+# 国内站与国际站的模型集几乎不重叠，所以混装账号时这一定会发生。
+_MODEL_UNAVAILABLE_CODE = 11102
+
+
+def _model_unavailable_error(status: int, detail) -> bool:
+    """判断上游拒绝的原因是不是「这个账号服务不了这个模型」。
+
+    这类失败不是协议错误，也不是账号故障 —— 换个账号就能成功，所以必须当成
+    「可换号」处理，而且不能给账号记失败（账号本身是好的）。
+    """
+    if status != 400 or not isinstance(detail, dict):
+        return False
+    node = detail.get("error") if isinstance(detail.get("error"), dict) else detail
+    if node.get("code") == _MODEL_UNAVAILABLE_CODE:
+        return True
+    return str(node.get("msg") or node.get("message") or "").startswith("model [")
 
 
 async def _retry_delay(attempt: int):
@@ -354,11 +452,21 @@ _DEBUG_REJECT_DIR = os.environ.get("CB_GATEWAY_DEBUG_REJECT_DIR", "").strip()
 _DEBUG_REJECT_KEEP = 20
 
 
-def _dump_rejected_request(body: dict, status: int, raw_error: bytes) -> None:
+def _dump_rejected_request(
+    body: dict,
+    status: int,
+    raw_error: bytes,
+    *,
+    url: str = "",
+    account_id: Optional[int] = None,
+) -> None:
     """上游返回 4xx 时把请求体落盘，便于定位协议类报错（如 11155）。
 
     默认写入 <项目目录>/debug_rejects，最多保留最近 20 份；
     用 CB_GATEWAY_DEBUG_REJECT_DIR=off 可关闭。
+
+    一并记下实际打出去的 URL 与账号 id —— 否则拿到一份 401 样本也无从判断是哪个
+    账号、发到了哪个站点（混装国内/国际账号时这正是最需要的信息）。
     """
     if status < 400 or status >= 500:
         return
@@ -389,6 +497,8 @@ def _dump_rejected_request(body: dict, status: int, raw_error: bytes) -> None:
                 {
                     "status": status,
                     "error": raw_error.decode("utf-8", "replace")[:2000],
+                    "url": url,
+                    "account_id": account_id,
                     "model": body.get("model"),
                     "reasoning_effort": body.get("reasoning_effort"),
                     "messages_summary": summary,
@@ -836,50 +946,6 @@ def _log_request(api_key_info, account, model_name, stream,
         pass
 
 
-def _sse_from_chat_completion(result: dict) -> list[bytes]:
-    choice = (result.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    model = result.get("model") or "auto"
-    cid = result.get("id") or ("chatcmpl-" + os.urandom(12).hex())
-    created = result.get("created") or int(time.time())
-    finish = choice.get("finish_reason") or "stop"
-    delta: dict = {"role": "assistant"}
-    if message.get("content"):
-        delta["content"] = message["content"]
-    if message.get("reasoning_content"):
-        delta["reasoning_content"] = message["reasoning_content"]
-    tool_calls = message.get("tool_calls") or []
-    if tool_calls:
-        delta["tool_calls"] = [
-            {
-                "index": index,
-                "id": item.get("id"),
-                "type": item.get("type") or "function",
-                "function": item.get("function") or {},
-            }
-            for index, item in enumerate(tool_calls)
-            if isinstance(item, dict)
-        ]
-    chunks = [
-        {
-            "id": cid,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-        },
-        {
-            "id": cid,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-            "usage": result.get("usage") or {},
-        },
-    ]
-    return [_json_sse_event(item) for item in chunks] + [b"data: [DONE]\n\n"]
-
-
 async def _json_chat_with_stall_retry(
     body: dict,
     api_key_info: Optional[dict],
@@ -890,7 +956,9 @@ async def _json_chat_with_stall_retry(
     last_error = None
 
     for attempt in range(max_retries):
-        account = await auth_manager.pick_account_with_fallback(tried_ids)
+        account = await auth_manager.pick_account_with_fallback(
+            tried_ids, model=body.get("model")
+        )
         if not account:
             break
 
@@ -900,7 +968,7 @@ async def _json_chat_with_stall_retry(
             auth_manager.mark_account_failure(account["id"], 401)
             continue
 
-        url = f"{auth_manager.backend_url()}/v2/chat/completions"
+        url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
         t0 = time.time()
         result = await _collect_stream(url, headers, body, account, api_key_info, model_name, t0)
         if result[0] == "json":
@@ -930,9 +998,17 @@ async def _json_chat_with_stall_retry(
 
         last_error = result
         err_status = result[1][0]
-        auth_manager.mark_account_failure(account["id"], err_status)
-        will_retry = _is_retryable_status(err_status) and attempt < max_retries - 1
         detail = result[1][1]
+        # 模型不属于这个账号的站点：换号就能成功，别把账号记成故障（它本身是好的），
+        # 但要记住「这个账号服务不了这个模型」，下次直接跳过、不再浪费一次往返。
+        model_blocked = _model_unavailable_error(err_status, detail)
+        if model_blocked:
+            auth_manager.mark_model_denied(account["id"], body.get("model"))
+        else:
+            auth_manager.mark_account_failure(account["id"], err_status)
+        will_retry = (
+            model_blocked or _is_retryable_status(err_status)
+        ) and attempt < max_retries - 1
         error_message = detail
         if isinstance(detail, dict):
             error_data = detail.get("error") if isinstance(detail.get("error"), dict) else detail
@@ -953,21 +1029,34 @@ async def _json_chat_with_stall_retry(
     )
 
 
-async def _stream_collected_with_stall_retry(
+async def _stream_with_stall_guard(
     body: dict,
     api_key_info: Optional[dict],
     model_name: str,
 ) -> AsyncGenerator[bytes, None]:
-    result = await _json_chat_with_stall_retry(body, api_key_info, model_name)
-    if result[0] == "error":
-        status, detail = result[1]
-        if isinstance(detail, dict):
-            yield _json_sse_event(detail)
-            yield b"data: [DONE]\n\n"
-        else:
-            yield _err_sse_event(str(detail).encode("utf-8"), status)
+    """工具回合：先按流式转发，停转且正文未下发时再用 tool_choice=required 重打一次。
+
+    替代早先的 _stream_collected_with_stall_retry —— 那条路为了能回退重打，把上游响应
+    整段收完才吐给客户端，导致工具回合全程没有流式输出（实测单轮静默 6~186 秒，
+    客户端一个字都收不到）。现在改成只扣住正文增量，推理内容即时下发。
+    """
+    report: dict = {}
+    async for chunk in _stream_upstream(
+        body, api_key_info, model_name, hold_content=True, report=report
+    ):
+        yield chunk
+
+    # 正文已经发出去就收不回来了；只有「停转 + 正文未下发」才值得重打。
+    if not report.get("stall") or report.get("content_released"):
         return
-    for chunk in _sse_from_chat_completion(result[1]):
+
+    retry_report: dict = {}
+    async for chunk in _stream_upstream(
+        {**body, "tool_choice": "required"},
+        api_key_info,
+        model_name,
+        report=retry_report,
+    ):
         yield chunk
 
 
@@ -994,7 +1083,7 @@ async def proxy_chat_completions(
         if TOOL_STALL_RETRY and _request_has_tool_loop(body):
             return (
                 "stream",
-                _stream_collected_with_stall_retry(body, api_key_info, model_name),
+                _stream_with_stall_guard(body, api_key_info, model_name),
             )
         return (
             "stream",
@@ -1020,7 +1109,7 @@ async def test_account_chat(account: dict, model: str = "auto", prompt: str = "p
         "messages": [{"role": "user", "content": prompt or "ping"}],
         "stream": False,
     })
-    url = f"{auth_manager.backend_url()}/v2/chat/completions"
+    url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
     t0 = time.time()
     result = await _collect_stream(url, headers, body, account, None, f"account-test:{model or 'auto'}", t0)
     duration_ms = int((time.time() - t0) * 1000)
@@ -1055,8 +1144,14 @@ async def _stream_upstream(
     body: dict,
     api_key_info: Optional[dict],
     model_name: str,
+    hold_content: bool = False,
+    report: Optional[dict] = None,
 ) -> AsyncGenerator[bytes, None]:
-    """Stream upstream SSE with pre-output account failover and backoff."""
+    """Stream upstream SSE with pre-output account failover and backoff.
+
+    hold_content=True 时正文增量先扣在 _ContentHold 里（见该类注释）；report 用来把
+    「这一轮是否停转、正文有没有下发」回传给调用方，决定要不要整轮重打。
+    """
     tried_ids: set[int] = set()
     last_error = b"No available accounts"
     last_error_event: dict | None = None
@@ -1066,7 +1161,9 @@ async def _stream_upstream(
     pending_retry_log: dict | None = None
 
     for attempt in range(3):
-        account = await auth_manager.pick_account_with_fallback(tried_ids)
+        account = await auth_manager.pick_account_with_fallback(
+            tried_ids, model=body.get("model")
+        )
         if not account:
             break
         if pending_retry_log is not None:
@@ -1097,11 +1194,12 @@ async def _stream_upstream(
             last_status = 401
             continue
 
-        url = f"{auth_manager.backend_url()}/v2/chat/completions"
+        url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
         t0 = time.time()
         last_started = t0
         observer = _ChatStreamObserver(body.get("model") or model_name, body.get("n", 1))
         decoder = _SSEEventDecoder()
+        hold = _ContentHold(_STALL_SHORT_LIMIT) if hold_content else None
         output_started = False
         pending_terminal_events: list[bytes] = []
         pending_terminal_bytes = 0
@@ -1118,12 +1216,33 @@ async def _stream_upstream(
                 async with client.stream("POST", url, headers=headers, json=body) as response:
                     if response.status_code != 200:
                         raw_error = await response.aread()
-                        _dump_rejected_request(body, response.status_code, raw_error)
+                        _dump_rejected_request(
+                            body,
+                            response.status_code,
+                            raw_error,
+                            url=url,
+                            account_id=account["id"],
+                        )
                         last_error = raw_error
                         last_error_event = None
                         last_status = response.status_code
-                        auth_manager.mark_account_failure(account["id"], response.status_code)
-                        if _is_retryable_status(response.status_code) and attempt < 2:
+                        detail = _safe_err(raw_error, response.status_code)
+                        # 见 _model_unavailable_error：模型不属于这个账号的站点，
+                        # 换号能成功，别把账号记成故障。
+                        model_blocked = _model_unavailable_error(
+                            response.status_code, detail
+                        )
+                        if model_blocked:
+                            auth_manager.mark_model_denied(
+                                account["id"], body.get("model")
+                            )
+                        else:
+                            auth_manager.mark_account_failure(
+                                account["id"], response.status_code
+                            )
+                        if (
+                            model_blocked or _is_retryable_status(response.status_code)
+                        ) and attempt < 2:
                             pending_retry_log = {
                                 "account": account,
                                 "prompt_tokens": 0,
@@ -1160,7 +1279,15 @@ async def _stream_upstream(
                                         )
                                 else:
                                     output_started = True
-                                    yield encoded
+                                    if hold is None:
+                                        yield encoded
+                                    else:
+                                        for ready in hold.feed(
+                                            encoded,
+                                            _event_content_chars(obj),
+                                            _event_has_tool_calls(obj),
+                                        ):
+                                            yield ready
                             if (
                                 observer.seen_done
                                 or observer.parser_error
@@ -1213,7 +1340,15 @@ async def _stream_upstream(
                             )
                     else:
                         output_started = True
-                        yield encoded
+                        if hold is None:
+                            yield encoded
+                        else:
+                            for ready in hold.feed(
+                                encoded,
+                                _event_content_chars(obj),
+                                _event_has_tool_calls(obj),
+                            ):
+                                yield ready
         if decoder.parser_error and not observer.seen_done:
             observer.parser_error = decoder.parser_error
 
@@ -1269,6 +1404,8 @@ async def _stream_upstream(
         audit_blocked = _looks_like_audit_block(full_text)
         finish_reason = next((reason for reason in observer.finish_reasons.values() if reason), None)
         tool_stall = _is_tool_stall(body, finish_reason, bool(observer.tool_call_choices), full_text)
+        # 停转 + 正文一个字节都没下发 → 这一轮可以整轮重打（见 _stream_with_stall_guard）。
+        can_retry_stall = bool(hold is not None and tool_stall and not hold.released)
         log_finish = "content_filter" if audit_blocked else ("tool_stall" if tool_stall else (finish_reason or "stop"))
         log_error = (
             ("[audit blocked] " + full_text[:300]) if audit_blocked
@@ -1282,10 +1419,17 @@ async def _stream_upstream(
             observer.usage.get("total_tokens", 0),
             observer.usage.get("credit", 0),
             log_finish, 200, log_error, t0,
+            # 要重打的一轮不计用量，最终结果由重打那一轮记账（避免一次请求算两次）。
+            increment_usage=not can_retry_stall,
         )
-        if tool_stall and TOOL_STALL_FAIL_STREAM:
+        if report is not None:
+            report["stall"] = tool_stall
+            report["content_released"] = hold.released if hold is not None else True
+        if tool_stall and TOOL_STALL_FAIL_STREAM and not can_retry_stall:
             # 流式已发出文本增量，无法回退重试；把本回合标记为失败，
             # 让有重试机制的客户端（DSH / OpenCode 等）自动重试。
+            if hold is not None:
+                hold.drop()
             yield _json_sse_event({
                 "error": {
                     "message": "The model finished a tool turn without calling a tool.",
@@ -1295,6 +1439,14 @@ async def _stream_upstream(
             })
             yield b"data: [DONE]\n\n"
             return
+        if can_retry_stall:
+            # 这一轮要整轮重打，客户端不该看到它的任何输出（含终止事件与 [DONE]）。
+            hold.drop()
+            return
+        if hold is not None:
+            # 不是停转（或已转直通）时，把扣留的正文补发出去。
+            for event in hold.flush():
+                yield event
         for event in pending_terminal_events:
             yield event
         if synthetic_terminal is not None:

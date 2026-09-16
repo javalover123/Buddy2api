@@ -19,6 +19,7 @@
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -41,6 +42,7 @@ def _clear_route_state():
         auth_manager._verify_inflight.clear()
         auth_manager._account_models.clear()
         auth_manager._account_denied.clear()
+        auth_manager.forget_cost_profile()
 
     _reset()
     yield
@@ -63,16 +65,39 @@ def _make_account(uid: str, domain: str, provider: str = "workbuddy", status: st
 
 
 def _set_requests(aid: int, total: int) -> None:
-    """total_requests 不在 update_account 的白名单里，直接改库。"""
+    """直接改 accounts.total_requests（终身计数，不在 update_account 白名单里）。
+
+    注意：这**不再是选路的负载信号**（选路看 db.recent_account_loads 的窗口），
+    只有专门验证「终身计数不影响路由」的测试才用它。要制造负载请用 _serve。
+    """
     conn = db.get_conn()
     conn.execute("UPDATE accounts SET total_requests = ? WHERE id = ?", (total, aid))
     conn.commit()
     conn.close()
 
 
-def _bump_requests(aid: int) -> None:
+def _serve(
+    aid: int,
+    n: int = 1,
+    *,
+    model: str = "m",
+    credit: float = 0.0,
+    age_seconds: int = 0,
+) -> None:
+    """记录「这个账号服务了 n 次请求」—— 这才是选路的负载信号。
+
+    选路用 db.recent_account_loads()（最近 ROUTE_WINDOW_SECONDS 内的成功请求数），
+    数据来源就是 logs 表，所以测试必须真的写日志行，不能只改计数器。
+    age_seconds 用来把记录推到窗口之外（验证窗口会过期）。
+    """
+    created = int(time.time()) - age_seconds
     conn = db.get_conn()
-    conn.execute("UPDATE accounts SET total_requests = total_requests + 1 WHERE id = ?", (aid,))
+    for _ in range(n):
+        conn.execute(
+            "INSERT INTO logs (account_id, account_name, model, status_code, credit,"
+            " created_at, provider) VALUES (?,?,?,200,?,?,'workbuddy')",
+            (aid, f"acc-{aid}", model, credit, created),
+        )
     conn.commit()
     conn.close()
 
@@ -246,7 +271,7 @@ def test_sticky_holds_while_balanced():
     auth_manager.record_account_models(a, ["m"])
     auth_manager.record_account_models(b, ["m"])
     first = auth_manager.pick_account(model="m")["id"]
-    _bump_requests(first)
+    _serve(first)
     # 只领先 1 个请求，还在容差内，继续粘住（保住 prompt cache）
     assert auth_manager.pick_account(model="m")["id"] == first
 
@@ -261,14 +286,12 @@ def test_sticky_yields_so_load_spreads():
     b = _make_account("b", "www.workbuddy.ai")
     auth_manager.record_account_models(a, ["m"])
     auth_manager.record_account_models(b, ["m"])
-    _set_requests(a, 0)
-    _set_requests(b, 0)
 
     picks = []
     for _ in range(20):
         chosen = auth_manager.pick_account(model="m")["id"]
         picks.append(chosen)
-        _bump_requests(chosen)
+        _serve(chosen)
 
     assert set(picks) == {a, b}, "两个账号都该被用上"
     assert abs(picks.count(a) - picks.count(b)) <= 4, picks
@@ -280,8 +303,7 @@ def test_sticky_yields_to_idle_account_immediately():
     auth_manager.record_account_models(a, ["m"])
     auth_manager.record_account_models(b, ["m"])
     auth_manager._set_sticky_account(a, "workbuddy", "m")
-    _set_requests(a, 500)
-    _set_requests(b, 0)
+    _serve(a, 500)
     assert auth_manager.pick_account(model="m")["id"] == b
 
 
@@ -297,11 +319,65 @@ def test_sticky_slack_is_constant_not_weight_scaled():
     db.update_account(heavy, {"weight": 200})
     auth_manager.record_account_models(light, ["m"])
     auth_manager.record_account_models(heavy, ["m"])
-    _set_requests(light, 5000)   # 负载 50.0
-    _set_requests(heavy, 4000)   # 负载 20.0
+    _serve(light, 5000)   # 负载 50.0
+    _serve(heavy, 4000)   # 负载 20.0
     auth_manager._set_sticky_account(light, "workbuddy", "m")
     # heavy 权重更高、负载更低，应该让位给它
     assert auth_manager.pick_account(model="m")["id"] == heavy
+
+
+def test_lifetime_counters_do_not_affect_routing():
+    """终身计数差很大也不能把请求锁死在同一个账号上（真实故障的回归测试）。
+
+    线上实测两个国际账号终身计数 1110 / 754。旧逻辑拿它当负载信号，而它只增不减，
+    差值远大于粘性容差 1.0，「少的先用」就退化成「永远只用计数较低的那个」——
+    表现为「所有请求都固定路由到一个账号」。
+    选路改用滑动窗口后，终身计数只用于展示，不再影响选择。
+    """
+    a = _make_account("a", "www.workbuddy.ai")
+    b = _make_account("b", "www.workbuddy.ai")
+    auth_manager.record_account_models(a, ["m"])
+    auth_manager.record_account_models(b, ["m"])
+    _set_requests(a, 1110)
+    _set_requests(b, 754)
+
+    picks = []
+    for _ in range(20):
+        chosen = auth_manager.pick_account(model="m")["id"]
+        picks.append(chosen)
+        _serve(chosen)
+
+    assert set(picks) == {a, b}, f"终身计数不该决定路由，实际只用了 {set(picks)}"
+    assert abs(picks.count(a) - picks.count(b)) <= 4, picks
+
+
+def test_route_window_expires_so_old_load_is_forgiven():
+    """窗口之外的旧负载不计入 —— 否则「窗口」只是换了个名字的终身计数。"""
+    a = _make_account("a", "www.workbuddy.ai")
+    b = _make_account("b", "www.workbuddy.ai")
+    auth_manager.record_account_models(a, ["m"])
+    auth_manager.record_account_models(b, ["m"])
+    # a 曾经很忙，但都是很久以前的请求
+    _serve(a, 500, age_seconds=db.ROUTE_WINDOW_SECONDS + 60)
+    assert db.recent_account_loads().get(a, 0) == 0
+    auth_manager._set_sticky_account(a, "workbuddy", "m")
+    # 旧负载已出窗口，a 不再被判为更累
+    assert auth_manager.pick_account(model="m")["id"] == a
+
+
+def test_failed_requests_do_not_count_as_load():
+    """只统计 2xx：失败/被拒的尝试没占用上游生成额度，不该让账号显得很忙。"""
+    a = _make_account("a", "www.workbuddy.ai")
+    conn = db.get_conn()
+    for _ in range(50):
+        conn.execute(
+            "INSERT INTO logs (account_id, account_name, model, status_code, created_at, provider)"
+            " VALUES (?,?,'m',400,?,'workbuddy')",
+            (a, f"acc-{a}", int(time.time())),
+        )
+    conn.commit()
+    conn.close()
+    assert db.recent_account_loads().get(a, 0) == 0
 
 
 # ============================================================
@@ -340,8 +416,7 @@ def test_model_blocked_400_switches_account_without_blaming_it(monkeypatch):
     """400「模型不属于这个账号」要换号，但不能把账号记成故障。"""
     blocked = _make_account("blocked", "www.workbuddy.cn")
     healthy = _make_account("healthy", "www.workbuddy.ai")
-    _set_requests(blocked, 0)
-    _set_requests(healthy, 1)  # 让被拒的那个先被选中
+    _serve(healthy, 1)  # 让被拒的那个（负载 0）先被选中
 
     seen: list[int] = []
 
@@ -438,11 +513,90 @@ def test_site_group_splits_domestic_from_international():
     assert sites.site_group(None) == sites.SITE_INTERNATIONAL
 
 
-def test_site_preference_is_off_by_default():
-    """没配置过就不能改变路由：默认不区分站点，而不是默默偏向某一边。"""
-    assert auth_manager.model_site_preference() == {"default": "", "models": {}}
+def test_site_preference_defaults_to_auto_and_is_neutral_without_data():
+    """默认 auto：从实测计费学「哪边免费/更便宜」。
+
+    关键是「没数据时不偏向任何一边」——auto 在没有计费样本时必须退回不区分站点，
+    否则引入这个默认值就等于把某一边的账号静默降级了。
+    """
+    assert auth_manager.model_site_preference() == {"default": "auto", "models": {}}
     assert auth_manager.preferred_site_for("deepseek-v4.1-flash") == ""
     assert auth_manager.preferred_site_for(None) == ""
+
+
+def test_auto_prefers_the_free_site_for_that_model():
+    """实测数据说国际站免费、国内站扣费 → auto 优先国际站。
+
+    这是本次修复的核心诉求：免费模型不该被路由到收费的账号上。
+    """
+    intl = _make_account("intl", "www.workbuddy.ai")
+    cn = _make_account("cn", "www.workbuddy.cn")
+    auth_manager.record_account_models(intl, ["m"])
+    auth_manager.record_account_models(cn, ["m"])
+    _serve(cn, 10, model="m", credit=0.34)   # 国内站：每次都扣费
+    _serve(intl, 10, model="m", credit=0.0)  # 国际站：完全免费
+    auth_manager.forget_cost_profile()
+
+    assert auth_manager.preferred_site_for("m") == sites.SITE_INTERNATIONAL
+    picks = [
+        auth_manager.pick_account(model="m")["id"]
+        for _ in range(10)
+    ]
+    assert set(picks) == {intl}, "免费模型不该落到收费账号上"
+
+
+def test_auto_prefers_cheaper_site_when_both_charge():
+    """两边都收费时选单价低的（你说的「先路由收费低的」）。"""
+    intl = _make_account("intl", "www.workbuddy.ai")
+    cn = _make_account("cn", "www.workbuddy.cn")
+    auth_manager.record_account_models(intl, ["m"])
+    auth_manager.record_account_models(cn, ["m"])
+    _serve(cn, 10, model="m", credit=1.0)   # 均价 1.0
+    _serve(intl, 10, model="m", credit=0.1)  # 均价 0.1
+    auth_manager.forget_cost_profile()
+    assert auth_manager.preferred_site_for("m") == sites.SITE_INTERNATIONAL
+
+
+def test_auto_stays_neutral_when_costs_are_equal():
+    """收费一样就不区分站点，否则白白损失负载均衡。"""
+    intl = _make_account("intl", "www.workbuddy.ai")
+    cn = _make_account("cn", "www.workbuddy.cn")
+    auth_manager.record_account_models(intl, ["m"])
+    auth_manager.record_account_models(cn, ["m"])
+    _serve(cn, 10, model="m", credit=0.5)
+    _serve(intl, 10, model="m", credit=0.5)
+    auth_manager.forget_cost_profile()
+    assert auth_manager.preferred_site_for("m") == ""
+
+
+def test_auto_waits_for_enough_samples():
+    """样本太少不下结论：宁可先不区分站点，也不要凭一两次请求误判计费。"""
+    intl = _make_account("intl", "www.workbuddy.ai")
+    cn = _make_account("cn", "www.workbuddy.cn")
+    _serve(cn, 2, model="m", credit=0.9)
+    _serve(intl, 2, model="m", credit=0.0)
+    auth_manager.forget_cost_profile()
+    assert auth_manager.preferred_site_for("m") == ""
+
+
+def test_auto_ignores_failed_requests_when_learning_costs():
+    """学计费只看成功的请求：失败的尝试没有扣费记录，混进来会把画像带偏。"""
+    intl = _make_account("intl", "www.workbuddy.ai")
+    cn = _make_account("cn", "www.workbuddy.cn")
+    conn = db.get_conn()
+    for _ in range(20):
+        conn.execute(
+            "INSERT INTO logs (account_id, account_name, model, status_code, credit,"
+            " created_at, provider) VALUES (?,?,'m',500,0.0,?,'workbuddy')",
+            (cn, f"acc-{cn}", int(time.time())),
+        )
+    conn.commit()
+    conn.close()
+    _serve(cn, 10, model="m", credit=0.5)
+    _serve(intl, 10, model="m", credit=0.5)
+    auth_manager.forget_cost_profile()
+    # 500 的 20 条不计入，两边各 10 条且均价相同 → 不区分
+    assert auth_manager.preferred_site_for("m") == ""
 
 
 def test_site_preference_falls_back_to_default_for_unlisted_model():
@@ -457,7 +611,8 @@ def test_site_preference_falls_back_to_default_for_unlisted_model():
 def test_site_preference_survives_broken_setting():
     """配置写坏时用默认值，不能让路由整个挂掉。"""
     db.set_setting("model_site_preference", "not-a-dict")
-    assert auth_manager.model_site_preference() == {"default": "", "models": {}}
+    assert auth_manager.model_site_preference() == {"default": "auto", "models": {}}
+    # 字段存在但取值非法 → 退回「不区分」（与「设置不存在 → auto」不同，但同样安全）
     db.set_setting("model_site_preference", {"default": "nonsense", "models": {"m": 7}})
     assert auth_manager.model_site_preference() == {"default": "", "models": {"m": ""}}
 
@@ -468,8 +623,7 @@ def test_site_preference_overrides_load_balancing_for_that_model():
     cn = _make_account("cn", "www.workbuddy.cn", status="active")
     auth_manager.record_account_models(intl, ["m"])
     auth_manager.record_account_models(cn, ["m"])
-    _set_requests(intl, 999)   # 国际账号很累，但配置要求优先用它
-    _set_requests(cn, 0)
+    _serve(intl, 999)   # 国际账号很累，但配置要求优先用它
     db.set_setting("model_site_preference", {"default": "", "models": {"m": "international"}})
     assert auth_manager.pick_account(model="m")["id"] == intl
 
@@ -518,7 +672,7 @@ def test_site_preference_clean_rejects_bad_values():
 
 
 def test_reset_request_counts_levels_the_field():
-    """归零计数是让粘性/负载重新均衡的唯一途径（total_requests 只增不减）。"""
+    """归零只是清掉展示用的累计统计；选路看窗口，不靠它。"""
     a = _make_account("a", "www.workbuddy.ai", status="active")
     b = _make_account("b", "www.workbuddy.cn", status="active")
     _set_requests(a, 1110)
@@ -528,10 +682,11 @@ def test_reset_request_counts_levels_the_field():
     assert db.get_account(a)["total_requests"] == 0
     assert db.get_account(b)["total_requests"] == 0
 
-    # 同一水位之后两个账号都会被用上，而不是一直压在原来最闲的那个上
+    # 即使不归零，窗口选路也会把负载摊到两个账号上（见
+    # test_lifetime_counters_do_not_affect_routing）；归零后同样如此。
     picks = []
     for _ in range(10):
         chosen = auth_manager.pick_account(model="m")["id"]
         picks.append(chosen)
-        _bump_requests(chosen)
+        _serve(chosen)
     assert set(picks) == {a, b}, picks

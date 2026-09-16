@@ -979,10 +979,11 @@ const app=createApp({
 </div>`
 }).component('mdls',{props:['token','toast'],setup(p){
   const al=ref({}),builtinKeys=ref({}),aliasChannel=ref('workbuddy'),ld=ref(true),sources=ref([]),syncing=ref(false),adding=ref(false),addOpen=ref(false);
-  // 站点偏好：同一个模型在国内站与国际站计费不同（deepseek-v4.1-flash 国际站免费、
-  // 国内站扣额度），所以按模型选优先用哪边的账号。空串=不区分。
-  const sitePref=ref({default:'',models:{}}),siteDefault=ref('');
-  const siteGroups=[{id:'',label:'不区分'},{id:'international',label:'国际版优先'},{id:'domestic',label:'国内版优先'}];
+  // 站点偏好：同一个模型在国内站与国际站计费不同，而且方向不一定（deepseek-v4.1-flash
+  // 国际站免费、国内站扣额度；glm-5.3 反过来国际站收费），所以默认交给 auto —— 从历史
+  // 请求日志里学「哪边免费/更便宜」。空串=不区分。
+  const sitePref=ref({default:'auto',models:{}}),siteDefault=ref('auto');
+  const siteGroups=[{id:'auto',label:'自动（按实测计费）'},{id:'international',label:'国际版优先'},{id:'domestic',label:'国内版优先'},{id:'',label:'不区分'}];
   const FALLBACK_CH=[{id:'workbuddy',display_name:'WorkBuddy'},{id:'qclaw',display_name:'QClaw'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'traework',display_name:'TraeWork'}];
   const addForm=reactive({channel:'workbuddy',id:'',name:''});
   const newKey=ref(''),newVal=ref('');
@@ -994,7 +995,7 @@ const app=createApp({
     if(!maps[aliasChannel.value]&&channels.value.length)aliasChannel.value=channels.value[0].id;
   }
   async function load(){ld.value=true;try{try{applyAliasSnapshot(await api.get('/admin/aliases',p.token))}catch(e){al.value={};builtinKeys.value={}}try{const snap=await api.get('/admin/models/catalogs',p.token);sources.value=snap.sources||[]}catch(e){sources.value=[]}try{applySitePref(await api.get('/admin/site-preference',p.token))}catch(e){applySitePref({})}}catch(e){p.toast('失败','err')}ld.value=false}
-  function applySitePref(snap){const models={...(snap&&snap.models||{})};sitePref.value={default:(snap&&snap.default)||'',models};siteDefault.value=(snap&&snap.default)||''}
+  function applySitePref(snap){const models={...(snap&&snap.models||{})};sitePref.value={default:(snap&&snap.default)||'auto',models};siteDefault.value=(snap&&snap.default)||'auto'}
   function siteFor(id){return sitePref.value.models[id]||''}
   function setSiteFor(id,v){const models={...sitePref.value.models};if(v)models[id]=v;else delete models[id];sitePref.value={default:sitePref.value.default,models}}
   async function saveSitePref(){
@@ -1080,7 +1081,7 @@ const app=createApp({
   </div>
   <div class="card" style="margin-bottom:12px">
     <div class="card-h">站点偏好<span class="sub">同一个模型两边计费不同时，优先用哪边的账号</span></div>
-    <div class="hint" style="padding:8px 16px">国内版与国际版分开计费（实测 deepseek-v4.1-flash 国际版免费、国内版扣额度），所以可以按模型指定优先用哪边。只影响优先级：偏好那边没有可用账号（或都已试过）时会自动退回另一边，不会让请求无账号可用。</div>
+    <div class="hint" style="padding:8px 16px">国内版与国际版分开计费，而且「免费」是「模型 × 站点」的属性：实测 deepseek-v4.1-flash 国际版 1750 次全部免费、国内版 497 次里 485 次扣费，而 glm-5.3 反过来国际版收费。默认的「自动」会从历史请求日志里统计每个模型两边的实际扣费，优先用免费或单次更便宜的那边；两边一样或样本不足 5 次时先不区分。只影响优先级：偏好那边没有可用账号（或都已试过）时会自动退回另一边，不会让请求无账号可用。</div>
     <div style="padding:8px 16px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <label style="font-size:12px;color:var(--fg2)">未单独配置的模型</label>
       <select class="selectctl" v-model="siteDefault" aria-label="默认站点偏好"><option v-for="g in siteGroups" :key="'d-'+g.id" :value="g.id">{{g.label}}</option></select>

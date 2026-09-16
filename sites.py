@@ -22,6 +22,12 @@ SITE_INTERNATIONAL = "international"
 SITE_DOMESTIC = "domestic"
 SITE_GROUPS = (SITE_INTERNATIONAL, SITE_DOMESTIC)
 
+# 站点偏好的第三个取值：不写死站点，由 auth_manager 按实测计费自动挑「免费/更便宜」的那边。
+# 放在这里而不是 auth_manager，是为了让写入侧校验（site_preference.py）与读取侧
+# （auth_manager）共用同一份可选值，不各自维护一份字符串。
+SITE_AUTO = "auto"
+SITE_PREFERENCE_CHOICES = (*SITE_GROUPS, SITE_AUTO)
+
 
 def normalize_domain(value) -> str:
     """把 auth 文件里的 domain 归一成裸主机名。

@@ -16,9 +16,10 @@ import secrets
 import uuid
 from typing import Optional
 
+import sites
+
 DEFAULT_IDE_VERSION = "2.109.2"
 
-_CN_ORIGIN = "https://www.codebuddy.cn"
 _GLOBAL_ORIGIN = "https://www.workbuddy.ai"
 
 STAINLESS_PACKAGE_VERSION = os.environ.get(
@@ -55,10 +56,13 @@ def stainless_os() -> str:
 
 
 def origin_for(domain: str) -> str:
-    """按账号域选择 Origin/Referer：workbuddy.ai 国际版，否则中国版。"""
-    if "workbuddy" in (domain or "").lower():
-        return _GLOBAL_ORIGIN
-    return _CN_ORIGIN
+    """按账号域选择 Origin/Referer。
+
+    必须与 `auth_manager.backend_url_for` 同源：请求发到哪个站，Origin/Referer 就
+    自称哪个站。国内账号用自己的站点域名（www.workbuddy.cn / www.codebuddy.cn），
+    其余回退国际站。判定逻辑见 sites.py，两边共用一份，避免再次分叉。
+    """
+    return sites.site_url(domain) or _GLOBAL_ORIGIN
 
 
 def _trace_id() -> str:

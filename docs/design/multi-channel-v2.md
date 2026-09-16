@@ -440,7 +440,13 @@ def list_accounts(*, provider: str | None = None) -> list[dict]:
 
 粘性状态：`_sticky_account_id: dict[str, int]`，键是 `(通道, 模型)` 的组合（见 `_sticky_key`），禁止全局一个 id。
 按模型分槽是必需的：国内站与国际站的模型集几乎不重叠，共用一个槽会让「只属于另一个站的模型」永远被顶到错误的账号上。
-`idx_accounts_provider_status` 只是过滤辅助；排序仍用现有 `_route_sort_key`（priority、weight、`total_requests/weight`）。
+`idx_accounts_provider_status` 只是过滤辅助；排序用 `_route_sort_key`（priority、weight、**窗口负载**/weight）。
+
+**选路的负载信号是滑动窗口，不是终身计数。** `accounts.total_requests` 同时是「已用统计」与历史选路依据，但它只增不减：线上实测两个国际账号 1110 / 754，差值远大于粘性容差 `_STICKY_LOAD_SLACK = 1.0`，「少的先用」就退化成「永远只用计数较低的那个」，看起来像固定路由到一个账号。
+现在 `_route_sort_key` / `_route_load` 取 `db.recent_account_loads()`（默认 15 分钟窗口、只算 2xx，`CB_GATEWAY_ROUTE_WINDOW_SECONDS` 可调），终身计数只用于展示。窗口会自我纠偏，不需要人工归零；`db.reset_account_request_counts()` 保留为「清掉展示统计」入口，不再影响路由。
+
+**自动站点偏好依赖实测计费。** `db.observed_site_costs()` 按 `(模型, 站点分组)` 统计「成功请求数 / 收过费的次数 / 累计扣费」，`auth_manager._auto_site_preference` 据此挑免费或单价低的站点（同样带 60s 缓存 `cost_profile`，因为查询要扫 30 天日志）。
+这也意味着「哪边免费」是**学出来的**，不是写死的：同一个模型两边可以完全相反（`deepseek-v4.1-flash` 国际免费、`glm-5.3` 国际收费）。
 
 `expires_at` **一律存整数毫秒**（与今天 WorkBuddy `is_token_expired` 的 `time.time()*1000 - 60_000` 一致）。QwenWork 若返回 ISO `expires_at`，在 `refresh()` 写库前换成 ms。每个 provider 必须实现 `is_token_expired`，禁止 WorkBuddy 函数去比较 QwenWork 行。
 
@@ -456,11 +462,12 @@ WorkBuddy 的 `domain` 决定账号属于哪个站点：`.cn` → 国内站（`w
 2. **跨站发模型不是协议错误。** 上游回 HTTP 400 + `code 11102`（`model [...] service info not found` / `is only available for authorized users`）。
    400 不在 `RETRYABLE_STATUS_CODES` 里，必须显式判定为「可换号」，**且不能给账号记失败**（账号本身是好的）。见 `proxy._model_unavailable_error`。
 3. **模型目录取并集。** 目录按「通道」存，只采样一个账号会让另一个站的模型整体从 `/v1/models` 消失。`catalog_accounts` 钩子返回该通道全部活跃账号。
-4. **同模型两边计费不同 → 站点偏好。** 实测 `deepseek-v4.1-flash` 国际站免费、国内站扣额度，所以「优先用哪边的账号」按模型配置（设置 `model_site_preference`，见 `site_preference.py`）。
-   与能力过滤同样是**只调优先级**：偏好站点没有账号、或账号都已被排除，就退回另一边的候选；默认不区分（空串），保证升级后行为不变。
+4. **同模型两边计费不同 → 站点偏好。** 实测 `deepseek-v4.1-flash` 国际站 1750 次全部免费、国内站 497 次里 485 次扣费（累计 167.66）；而 `glm-5.3` 反过来国际站收费。所以「免费」是 **(模型 × 站点)** 的属性，既不能按站点一刀切，模型目录里也没有价格字段 —— 只能从历史日志里学。
+   默认值 `auto`：`auth_manager._auto_site_preference` 按「收过费的次数 → 平均单次扣费」挑更划算的一边（见 `db.observed_site_costs`）；两边一样或样本 < 5 次则不区分。
+   与能力过滤同样是**只调优先级**：偏好站点没有账号、或账号都已被排除，就退回另一边的候选。
 
-**请求计数只增不减，会自己把均衡拉坏。** `total_requests` 同时是「已用统计」与选路依据（`_route_sort_key` 里的 `total_requests/weight`），但它从不衰减：老账号的计数迟早远高于新导入的账号，「少的先用」就退化成「只有最闲的一两个在跑」，看起来像固定路由到一个账号。
-`pick_account` 的粘性容差（`_STICKY_LOAD_SLACK`）在这种差距下永远不会触发让位，所以靠容差修不了。提供 `db.reset_account_request_counts()`（管理页「重置请求计数」/ `POST /admin/accounts/reset-request-counts`）把水位拉到同一水平；只归零 `total_requests`，不动 `total_tokens` / `total_credits`。
+**选路负载用滑动窗口，不用终身计数。** 终身计数（`total_requests`）只增不减，会把「少的先用」退化成「只用计数最低的那个」，正是「请求固定路由到一个账号」的直接原因；粘性容差在这种差距下永远不触发让位，靠容差修不了。
+改用 `db.recent_account_loads()`（15 分钟窗口、只算 2xx），窗口自己会纠偏；`db.reset_account_request_counts()` 保留为展示统计的归零入口。
 
 **鉴权失败的判定要抗抖动**：单次 401/403 不直接置 `expired`（混装站点时凭证被发到非所属站点会立刻 401，一次判死会永久停用仍有效的账号）。
 改为连续 `auth_failure_threshold` 次后，先用账号自己的站点做一次真实复核（`probe_account_credentials`），只有复核确认失效才置 `expired`；网络错误 / 5xx 一律不下结论。
@@ -1104,9 +1111,11 @@ PR8  2.0.0 发布
 - Docker：`CB_AUTH_DIR=/auth` 对仍挂载的用户不变；缺目录不再让 helper 失败。
 - `backend_url` 设置只影响 WorkBuddy，且**只对非国内站账号生效**：`domain` 以 `.cn` 结尾的账号一律走它自己的站点（`auth_manager.backend_url_for`），因为国内版凭证发到国际站会被上游直接 401。
 - `checkin-all` 顶层 `credit` 仅 WorkBuddy 且 deprecated。
-- 站点偏好（`model_site_preference`）与请求计数归零都是**新增**：不配置、不点击时行为与之前完全一致，无 breaking。
-  - `PUT /admin/site-preference`：`{"default": "international"|"domestic"|"", "models": {模型: 同上}}`，非法值 400。
-  - `POST /admin/accounts/reset-request-counts`：只归零 `accounts.total_requests`。
+- 站点偏好（`model_site_preference`）默认值由「不区分」改为 **`auto`**：从历史日志学「哪边免费/更便宜」。
+  未配置时不再是「完全不干预」：当某模型两边计费确有差异时，会优先用更划算的那边。学不到结论（无数据 / 样本 < 5 / 两边同价）时行为与之前一致。
+  - `PUT /admin/site-preference`：`{"default": "auto"|"international"|"domestic"|"", "models": {模型: 同上}}`，非法值 400。
+- **选路负载信号由终身计数改为滑动窗口**（`db.recent_account_loads`，15 分钟、只算 2xx）：即使不动配置，多账号分布也会变得均匀。
+  `accounts.total_requests` 不再是选路依据，只用于展示；`POST /admin/accounts/reset-request-counts` 仍可用，但只影响展示统计。
 
 ---
 
