@@ -16,6 +16,14 @@ from __future__ import annotations
 
 _CN_SUFFIX = ".cn"
 
+# 官方内部入口：token 由内部 realm 签发，只认自己的 token。国际版账号的 token 打过去
+# 会被 APISIX 直接 401（返回 HTML，根本不是业务后端的 JSON）。
+_TENCENT_ENTRY_SUFFIX = ".tencent.com"
+
+# 国际版账号域名族。只列实测存在的 *.workbuddy.ai——不把 *.codebuddy.ai 加进来：
+# 它没有实测证据，误判会把凭证发到一个不存在的域。
+_INTL_SUFFIX = ".workbuddy.ai"
+
 # 站点分组名。路由偏好（settings.model_site_preference）用这两个值表达「优先用哪边的
 # 账号」，所以字符串必须只有一处定义。
 SITE_INTERNATIONAL = "international"
@@ -51,6 +59,23 @@ def is_cn_domain(domain) -> bool:
     都不会被误判成国内站。
     """
     return _host_only(normalize_domain(domain)).endswith(_CN_SUFFIX)
+
+
+def is_intl_domain(domain) -> bool:
+    """是否国际版账号（`*.workbuddy.ai`）。"""
+    host = _host_only(normalize_domain(domain))
+    return host == _INTL_SUFFIX.lstrip(".") or host.endswith(_INTL_SUFFIX)
+
+
+def is_internal_entry(value) -> bool:
+    """是否官方内部入口（`copilot.tencent.com` 这类）。
+
+    它只认内部 realm 签发的 token：国际版账号的 token 打过去会被 APISIX 直接 401。
+    用来区分「用户配了真正的自定义 relay」与「backend_url 只是官方默认值」——
+    前者必须继续生效，后者不能让国际版账号白白 401。
+    """
+    host = _host_only(normalize_domain(value))
+    return host == _TENCENT_ENTRY_SUFFIX.lstrip(".") or host.endswith(_TENCENT_ENTRY_SUFFIX)
 
 
 def site_group(domain) -> str:

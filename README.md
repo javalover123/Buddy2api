@@ -33,6 +33,10 @@ python server.py
 
 1. **启动后账号页是空的，这是正常的。** 默认不再自动入库。到「账号」页：选通道 → 重新检测 → 一键导入。四个通道都能选。
 2. **一把 API Key 只打一个通道。** 创建时必须选通道。WorkBuddy 的 Key 发 `auto` / `glm-5.2`；QwenWork 的 Key 发 `auto` 或 `qwork-advanced`；TraeWork 的 Key 发 `auto` 或 `qwen-3.7-plus`。通道和模型对不上会 400 或 403，不会帮你转到另一家。
+
+   也可以**把一把 Key 钉在某个具体账号上**：创建或编辑 Key 时选一个账号，之后这把 Key 的请求只走那个账号，不再由调度挑选。想让某把 Key 单独消耗某个账号的额度时用它。绑定后如果该账号不可用（停用、冷却中、通道不符），请求会直接失败，**不会**静默换号——否则你会以为额度没动，其实已经在吃别的账号。不填就是默认的自动选号。
+
+   注意：这种失败目前和「通道里没有可用账号」共用同一个错误（503 `channel_unavailable`），看到它时记得先确认是不是钉住的账号挂了。
 3. **某个通道返回 503 `channel_unavailable`：** 这个通道还没导入可用账号。
 4. **QClaw / QwenWork 请在 Windows 上直接跑 `python server.py`。** Linux Docker 读不了这两家用 DPAPI 加密的本机文件；管理页会写明这一点。WorkBuddy 可以继续用 Docker。
 5. 本项目和聊天客户端最好在同一台电脑。客户端如果跑在 Docker 里，Base URL 填 `http://host.docker.internal:8787/v1`，不要填容器自己的 `127.0.0.1`。
@@ -136,7 +140,7 @@ python server.py
 - 端口 8787 被占用：关掉旧的 Buddy2api，或 `python server.py --port 8788`。
 - 网页里一个账号都没有：还没导入。选对通道再检测；登录目录不对就设 `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR`。
 - 创建 Key 失败：没选通道。
-- 客户端 503 `channel_unavailable`：这个 Key 绑定的通道还没有可用账号。
+- 客户端 503 `channel_unavailable`：这个 Key 绑定的通道还没有可用账号；如果这把 Key 钉了具体账号，也可能是钉住的账号当前不可用（停用 / 冷却中 / 通道不符）。改绑、或把绑定清成「不绑定」回到自动选号。
 - 客户端 403 `key_channel_mismatch`：模型带了别的通道前缀，和当前 Key 不一致。
 - 客户端 400 `unknown_model`：模型不属于这把 Key 的通道。换 Key，或改成该通道认识的 id。
 
@@ -176,7 +180,7 @@ python server.py
 | 字段 | 值 |
 |---|---|
 | Base URL | `http://127.0.0.1:8787/v1` |
-| API Key | 管理页创建，已绑定通道 |
+| API Key | 管理页创建，已绑定通道；可选再绑定到某个账号 |
 | 模型 | WorkBuddy：`auto` / `glm-5.2`。QClaw：`auto` 或 `qclaw/default`。QwenWork：`auto` 或 `qwork-advanced`。TraeWork：`auto` 或 `qwen-3.7-plus` |
 | Stream | 建议开 |
 
@@ -253,6 +257,7 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 | `CB_GATEWAY_PROVIDERS` | 启用哪些通道，逗号分隔。默认 `workbuddy,qclaw,qwenwork,traework`。只想留一家时再改 |
 | `CB_GATEWAY_AUTO_IMPORT` | 设 `1` 则启动时自动导入。默认 `0` |
 | `CB_GATEWAY_CHECKIN_GAP_MS` | 一键领取间隔，默认 `800` |
+| `CB_GATEWAY_ROUTE_WINDOW_SECONDS` | 选路负载统计窗口，默认 `900`（15 分钟）。窗口内服务请求少的账号先用 |
 | `CB_GATEWAY_DEFAULT_REASONING_EFFORT` | WorkBuddy DeepSeek V4 Pro/Flash 的默认思考强度，支持 `low` / `high` / `max`，默认 `high`；设为 `off` 可关闭默认值。Responses 的 `reasoning.effort` 或 Chat Completions 的 `reasoning_effort` 会覆盖它 |
 | `CB_AUTH_DIR` | WorkBuddy 登录目录 |
 | `CB_QCLAW_AUTH_DIR` | QClaw 登录目录 |

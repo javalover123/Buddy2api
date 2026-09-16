@@ -223,6 +223,37 @@ def test_backend_url_for_falls_back_for_non_cn(isolated_db):
         assert auth_manager.backend_url_for(account) == "https://www.workbuddy.ai", account
 
 
+def test_backend_url_for_sends_intl_accounts_to_their_own_site_on_default(isolated_db):
+    """backend_url 还是官方默认值时，国际版账号必须走自己的站点。
+
+    copilot.tencent.com 只认内部 realm 签发的 token，国际版 token 打过去会被
+    APISIX 直接 401（HTML，不是业务 JSON）。默认值下把国际版账号发到那里，等于
+    整条国际线路不可用 —— 实测过。
+    """
+    db.set_setting("backend_url", "https://copilot.tencent.com")
+    # 与国内站同一原则：发到账号自己的域名（大小写/尾斜杠会被归一）
+    for domain, expected in (
+        ("www.workbuddy.ai", "https://www.workbuddy.ai"),
+        ("foo.workbuddy.ai", "https://foo.workbuddy.ai"),
+        ("WWW.WorkBuddy.AI/", "https://www.workbuddy.ai"),
+    ):
+        assert auth_manager.backend_url_for({"domain": domain}) == expected
+    # 官方内部入口的其它形态同样算默认值
+    db.set_setting("backend_url", "https://staging-copilot.tencent.com")
+    assert auth_manager.backend_url_for({"domain": "www.workbuddy.ai"}) == "https://www.workbuddy.ai"
+
+
+def test_backend_url_for_keeps_custom_relay_for_intl_accounts(isolated_db):
+    """自定义 relay 必须继续生效，不能被「国际版走自己的站点」绕过。"""
+    db.set_setting("backend_url", "https://my-relay.example.com")
+    for domain in ("www.workbuddy.ai", "www.codebuddy.ai", ""):
+        assert auth_manager.backend_url_for({"domain": domain}) == "https://my-relay.example.com"
+    # 自定义 relay 也不影响国内站账号：它们一律走自己的站点
+    assert auth_manager.backend_url_for({"domain": "www.workbuddy.cn"}) == "https://www.workbuddy.cn"
+    # 没有实测证据的 .ai 域名族（codebuddy.ai）不猜，仍走 relay
+    assert auth_manager.backend_url_for({"domain": "foo.workbuddy.ai"}) == "https://my-relay.example.com"
+
+
 def test_probe_routes_codebuddy_cn_account(isolated_db, monkeypatch):
     """domain=www.codebuddy.cn 的账号必须打到 codebuddy.cn，不能再回退到 .ai。"""
     _clear_state()

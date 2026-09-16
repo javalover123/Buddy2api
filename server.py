@@ -236,6 +236,39 @@ def _check_client_auth(
     return key_info
 
 
+def _validate_key_account(value, channel: str) -> int:
+    """校验并归一化 API Key 的账号绑定值。0 = 不绑定，>0 = 只走该 accounts.id。"""
+    try:
+        account_id = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="default_account must be a non-negative integer",
+        )
+    if not account_id:
+        return 0
+    account = db.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=400, detail=f"Account {account_id} does not exist")
+    if str(account.get("provider") or "workbuddy") != channel:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Account {account_id} belongs to channel "
+                   f"'{account.get('provider') or 'workbuddy'}', not '{channel}'",
+        )
+    return account_id
+
+
+def _apply_key_account_pin(api_key_info: dict | None) -> None:
+    """按 API Key 的 default_account 把本次请求绑到固定账号。
+
+    只在请求入口调用一次：写入 contextvars 后，本次请求的异步生成器与
+    run_in_threadpool 都会继承它，所以流式响应里选号也生效。
+    刻意不在 finally 里复位 —— 端点返回后流式消费才真正开始，提前复位会丢失绑定。
+    """
+    auth_manager.set_pinned_account((api_key_info or {}).get("default_account"))
+
+
 def _reserve_client_quota(key_info: dict | None):
     if not key_info:
         return
@@ -390,9 +423,10 @@ async def list_models(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
 ):
-    await run_in_threadpool(
+    api_key_info = await run_in_threadpool(
         lambda: _check_client_auth(authorization, x_api_key, consume_quota=False)
     )
+    _apply_key_account_pin(api_key_info)
     return {"object": "list", "data": collect_v1_models()}
 
 
@@ -405,6 +439,7 @@ async def chat_completions(
     api_key_info = await run_in_threadpool(
         lambda: _check_client_auth(authorization, x_api_key, consume_quota=False)
     )
+    _apply_key_account_pin(api_key_info)
     payload = await _read_json_object(request)
 
     messages = payload.get("messages") or []
@@ -450,6 +485,7 @@ async def resp_responses(
     api_key_info = await run_in_threadpool(
         lambda: _check_client_auth(authorization, x_api_key, consume_quota=False)
     )
+    _apply_key_account_pin(api_key_info)
     payload = await _read_json_object(request)
     if "input" not in payload:
         raise HTTPException(
@@ -944,12 +980,20 @@ async def admin_create_key(
     if "default_channel" not in data or data.get("default_channel") in (None, ""):
         raise HTTPException(status_code=400, detail="default_channel is required")
     default_channel = _validate_key_channel(data.get("default_channel"))
+    default_account = _validate_key_account(data.get("default_account"), default_channel)
     # 生成 sk- 前缀的 key
     key = f"sk-cb-{secrets.token_urlsafe(32)}"
     kid = db.add_api_key(
-        key, name, allowed, daily_limit, client_type, default_channel=default_channel
+        key, name, allowed, daily_limit, client_type,
+        default_channel=default_channel, default_account=default_account,
     )
-    return {"id": kid, "key": key, "status": "ok", "default_channel": default_channel}
+    return {
+        "id": kid,
+        "key": key,
+        "status": "ok",
+        "default_channel": default_channel,
+        "default_account": default_account,
+    }
 
 
 @app.put("/admin/api-keys/{kid}")
@@ -971,6 +1015,13 @@ async def admin_update_key(
         raise HTTPException(status_code=400, detail="Invalid client_type")
     if "default_channel" in data:
         data["default_channel"] = _validate_key_channel(data.get("default_channel"))
+    if "default_account" in data:
+        # 校验要用「生效后」的通道：只改绑定时沿用该 Key 已有的 default_channel。
+        channel = str(data.get("default_channel") or "").strip()
+        if not channel:
+            existing = next((k for k in db.list_api_keys() if int(k["id"]) == kid), None)
+            channel = str((existing or {}).get("default_channel") or "workbuddy")
+        data["default_account"] = _validate_key_account(data.get("default_account"), channel)
     if "allowed_models" in data and (
         data["allowed_models"] is not None
         and (not isinstance(data["allowed_models"], list) or not all(isinstance(model, str) for model in data["allowed_models"]))

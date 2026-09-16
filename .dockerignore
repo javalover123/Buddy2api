@@ -6,6 +6,7 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+*.instance.lock.tmp
 data/
 .env
 .env.*
@@ -19,11 +20,15 @@ data/
 venv/
 .git/
 .lab-agent/
+.workbuddy/
+.workbuddy-ai/
 dist/
 build/
 release/
 logs/
 *.log
+# 上游 4xx 的请求体落盘，含真实对话内容，绝不能进镜像
+debug_rejects/
 *.zip
 *.7z
 *.rar

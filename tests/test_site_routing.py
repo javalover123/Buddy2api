@@ -118,13 +118,15 @@ def test_origin_matches_upstream_site_for_cn_accounts():
 
 
 def test_origin_for_non_cn_accounts_keeps_global_default():
-    """国际账号不受影响：上游回退全局 backend_url，Origin 仍是国际站。
+    """域未知的非国内账号仍回退全局 backend_url（自定义 relay 语义不变）。
 
-    copilot.tencent.com 是国际版的后端，Origin 用产品域名 workbuddy.ai 是既定行为，
-    这里只钉住「不要被国内链路改动带跑」。
+    `*.workbuddy.ai` 现在会在 backend_url 是官方默认值时改走自己的域（见
+    test_auth_failure_policy），这里钉住的是**其余**非国内域不被牵连，
+    以及 Origin 一律是国际站产品域。
     """
-    for domain in ("www.workbuddy.ai", "www.codebuddy.ai", ""):
+    for domain in ("www.codebuddy.ai", ""):
         assert auth_manager.backend_url_for({"domain": domain}) == auth_manager.backend_url()
+    for domain in ("www.workbuddy.ai", "www.codebuddy.ai", ""):
         assert fingerprint.origin_for(domain) == "https://www.workbuddy.ai"
 
 

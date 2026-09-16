@@ -23,6 +23,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      # 管理页的内联脚本用 `node --check` 做语法检查（tests/test_console_asset.py）。
+      # 不装 node 时那条测试会自动 skip —— 但那样就失去了一层防护，所以显式装上。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m compileall -q .

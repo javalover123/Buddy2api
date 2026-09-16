@@ -452,7 +452,8 @@ def list_accounts(*, provider: str | None = None) -> list[dict]:
 
 ### 多站点与模型路由
 
-WorkBuddy 的 `domain` 决定账号属于哪个站点：`.cn` → 国内站（`www.workbuddy.cn` / `www.codebuddy.cn`），其余 → 全局 `backend_url`。
+WorkBuddy 的 `domain` 决定账号属于哪个站点：`.cn` → 国内站（`www.workbuddy.cn` / `www.codebuddy.cn`），`*.workbuddy.ai` → 国际站，其余 → 全局 `backend_url`。
+（例外：`*.workbuddy.ai` 账号在 `backend_url` 仍是官方内部入口时也走自己的站点，理由见「变更记录」。）
 两个站点的**凭证与模型集都不通用**：实测国际站 18 个模型、国内站 29 个，交集只有 3 个。
 
 由此定下三条规则：
@@ -1110,6 +1111,7 @@ PR8  2.0.0 发布
 - `GET /v1/models`：`owned_by` 不变；新增 `channel`。
 - Docker：`CB_AUTH_DIR=/auth` 对仍挂载的用户不变；缺目录不再让 helper 失败。
 - `backend_url` 设置只影响 WorkBuddy，且**只对非国内站账号生效**：`domain` 以 `.cn` 结尾的账号一律走它自己的站点（`auth_manager.backend_url_for`），因为国内版凭证发到国际站会被上游直接 401。
+  **`*.workbuddy.ai` 账号在 `backend_url` 还是官方内部入口（默认值 `copilot.tencent.com`）时也走自己的站点**：那个入口只认内部 realm 签发的 token，国际版 token 打过去会被 APISIX 直接 401（返回 HTML，不是业务 JSON）。用户配了真正的自定义 relay 时不受此规则影响 —— relay 照旧生效，这是刻意保留的口子。判定见 `sites.is_intl_domain` / `sites.is_internal_entry`。
 - `checkin-all` 顶层 `credit` 仅 WorkBuddy 且 deprecated。
 - 站点偏好（`model_site_preference`）默认值由「不区分」改为 **`auto`**：从历史日志学「哪边免费/更便宜」。
   未配置时不再是「完全不干预」：当某模型两边计费确有差异时，会优先用更划算的那边。学不到结论（无数据 / 样本 < 5 / 两边同价）时行为与之前一致。

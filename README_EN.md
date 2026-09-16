@@ -31,6 +31,10 @@ Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
 
 1. **An empty Accounts page after startup is expected.** 2.0 does not import on boot. Pick a channel → Detect → Import. All four channels are in the dropdown.
 2. **One API key is one channel.** Create the key with a channel selected. A WorkBuddy key uses `auto` / `glm-5.2`; a QwenWork key uses `auto` or `qwork-advanced`; a TraeWork key uses `auto` or `qwen-3.7-plus`. Mismatched model/key returns 400 or 403 — there is no cross-vendor failover.
+
+   A key can also be **pinned to one account**: pick an account when creating or editing the key and every request from that key uses only that account, bypassing the scheduler. Use it when a key should spend one account's quota specifically. If the pinned account is unavailable (disabled, cooling down, or the wrong channel), the request fails instead of silently switching — otherwise you would think the quota was untouched while another account was being spent. Leave it unset for normal automatic routing.
+
+   Note: that failure currently shares the same error as “no usable account in the channel” (503 `channel_unavailable`), so when you see it, check whether the pinned account is the one that went down.
 3. **HTTP 503 `channel_unavailable`** means that channel has no imported account.
 4. **Run QClaw / QwenWork with `python server.py` on Windows.** A Linux Docker container cannot decrypt those DPAPI files; the UI says so. WorkBuddy can stay on Docker.
 5. If the chat client is itself in Docker, Base URL is `http://host.docker.internal:8787/v1`.
@@ -65,8 +69,34 @@ Later starts: `conda activate buddy2api` then `python server.py` in the project 
 - Port 8787 in use: stop the old process or `python server.py --port 8788`.
 - No accounts in the UI: import has not been run yet.
 - Key create fails: the channel dropdown is required.
+- 503 `channel_unavailable`: the key's channel has no usable account; if the key is pinned to a specific account, the pinned account may be the one unavailable (disabled / cooling down / wrong channel). Re-pin it, or clear the pin to return to automatic routing.
 - 403 `key_channel_mismatch`: the model prefix does not match the key’s channel.
 - 400 `unknown_model`: that model does not belong to this key’s channel.
+
+### Requests keep landing on one or two accounts?
+
+Account selection looks at **how many requests each account actually served in a recent window** (15 minutes by default, tunable with `CB_GATEWAY_ROUTE_WINDOW_SECONDS`); the least-loaded account goes first. A brief skew toward one account is therefore normal and self-corrects as the window slides.
+
+The **Requests** column in the accounts table is a **lifetime** counter. It only grows and **does not participate in routing**, so an old account's large historical count will never crowd out a newer one.
+
+Within a priority tier the order is weight first, then least in-window requests per weight, with a stickiness layer on top: the same model prefers to return to its previous account to preserve the prompt cache, and only yields once that account has served more than one weight unit beyond the idlest peer.
+
+### The same model costs different amounts on the international and domestic sites
+
+The international and domestic editions are billed separately, and **“free” is a property of the model × site pair, not of the site**:
+
+| Model | International | Domestic |
+| --- | --- | --- |
+| `deepseek-v4.1-flash` | free (1750/1750 requests charged 0) | billed (485 of 497 requests charged) |
+| `glm-5.3` | billed | — |
+
+So the default site preference is **`auto`**: it reads the request log, measures what each model actually cost on each site, and prefers the side that is free or cheaper per call. The order is “fewer charged requests” first, then lower average cost per call. Equal billing on both sides means the site is not distinguished (no point giving up load balancing), and fewer than 5 samples also means no distinction until there is enough data.
+
+To set it by hand, go to **Models → Site preference** and choose International / Domestic / Auto / No preference per model, or set a single default for models without their own entry.
+
+This is a pure preference: if the preferred side has no usable account, or all of its accounts have been tried, the request falls back to the other side rather than failing.
+
+Each account name on the Accounts page shows its site underneath (`国际版 · www.workbuddy.ai` / `国内版 · www.codebuddy.cn`); detection is by domain suffix only.
 
 ## Upgrade from 1.4.x
 
@@ -77,7 +107,7 @@ The database migrates on startup. Existing keys stay on `workbuddy`. Startup no 
 | Field | Value |
 |---|---|
 | Base URL | `http://127.0.0.1:8787/v1` |
-| API Key | Created in the UI, bound to one channel |
+| API Key | Created in the UI, bound to one channel; optionally pinned to one account |
 | Model | WorkBuddy `auto`; QClaw `auto`; QwenWork `qwork-advanced` |
 
 Unprefixed `auto` follows the key’s channel. Use a separate key per channel. On the Models page, “一键读取供应模型” refreshes each channel’s supplier list separately; a TraeWork-only id such as Doubao is never merged into WorkBuddy.
@@ -104,7 +134,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## Environment
 
-`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
+`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_GATEWAY_ROUTE_WINDOW_SECONDS` (default `900`, the load-averaging window used for account selection), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
 
 `CB_GATEWAY_DEFAULT_REASONING_EFFORT` controls the default reasoning effort for WorkBuddy DeepSeek V4 Pro/Flash. It accepts `low`, `high`, or `max`, defaults to `high`, and can be disabled with `off`. A Responses `reasoning.effort` or Chat Completions `reasoning_effort` value overrides the default.
 

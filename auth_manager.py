@@ -10,6 +10,7 @@ auth_manager.py — 多账号凭据管理
 """
 
 import asyncio
+import contextvars
 import json
 import os
 import sys
@@ -42,6 +43,15 @@ _route_lock = threading.Lock()
 _sticky_account_id: dict[str, int] = {}
 _failure_lock = threading.Lock()
 _account_failures: dict[int, tuple[int, float]] = {}
+
+# API Key 级账号绑定：0 = 不绑定（走优先级 + 粘性调度），>0 = 只用该 accounts.id。
+# 用 contextvars 而不是给 pick_account 加参数：这样 providers/* 与 proxy.py 的调用
+# 签名都不用改，由 server.py 在一次请求的入口处写入，本次请求的异步生成器与
+# run_in_threadpool 都会继承它（流式响应里选号也生效）。
+_pinned_account_id: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "cb_pinned_account_id", default=0
+)
+
 # 连续鉴权失败计数（401/403 或刷新被拒）。只有达到阈值才会触发复核/失效，
 # 避免一次瞬时 401 就把账号永久停用。
 _auth_failure_lock = threading.Lock()
@@ -119,9 +129,23 @@ def backend_url_for(account: Optional[dict] = None) -> str:
     openresty/APISIX 直接 401，随后 mark_account_failure 会把该账号误标成 expired
     （其实它的 token 还有效）。所以 domain 指向国内站点的账号必须走它自己的站点。
 
-    只对国内后缀做特判、不动 .ai 账号，这样自定义 relay 仍然对默认站点生效。
+    三类情况分开处理：
+
+    - `.cn` 账号：一律走它自己的站点。
+    - 国际版账号（`*.workbuddy.ai`）+ `backend_url` 是官方内部入口
+      （默认值 `copilot.tencent.com`）：走它自己的站点。那个入口只认内部 realm 签发的
+      token，国际版 token 打过去会被 APISIX 直接 401（返回 HTML，不是业务 JSON）。
+    - 其余（用户配了真正的自定义 relay、或域未知）：回退全局 `backend_url`。
+      自定义 relay 必须继续生效，这是刻意保留的口子。
     """
-    return sites.site_url((account or {}).get("domain")) or backend_url()
+    domain = (account or {}).get("domain")
+    url = sites.site_url(domain)
+    if url:
+        return url
+    fallback = backend_url()
+    if sites.is_intl_domain(domain) and sites.is_internal_entry(fallback):
+        return f"https://{sites.normalize_domain(domain)}"
+    return fallback
 
 
 def request_timeout(default: int) -> int:
@@ -1361,6 +1385,41 @@ def _sticky_overloaded(
     return _route_load(sticky, loads) > _route_load(chosen, loads) + _STICKY_LOAD_SLACK
 
 
+def set_pinned_account(aid) -> None:
+    """把当前请求绑定到固定账号。0/None/非法值 = 不绑定。"""
+    try:
+        value = int(aid or 0)
+    except (TypeError, ValueError):
+        value = 0
+    _pinned_account_id.set(value if value > 0 else 0)
+
+
+def pinned_account_id() -> int:
+    """当前请求绑定的账号 id，0 表示未绑定。"""
+    try:
+        return int(_pinned_account_id.get() or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pick_pinned_account(aid: int, exclude_ids: set[int], provider: str) -> Optional[dict]:
+    """绑定账号时的选择逻辑：只认这一个账号，不可用就返回 None。
+
+    刻意不做「换个账号重试」：Key 绑定账号的语义就是「这把 Key 只花这个账号的额度」，
+    静默换号会让调用方以为额度没动、实际已经在吃别的账号。要允许回退就别绑定。
+    """
+    if aid in exclude_ids or account_is_cooling_down(aid):
+        return None
+    target = db.get_account(aid)
+    if not target:
+        return None
+    if str(target.get("provider") or "workbuddy") != provider:
+        return None
+    if str(target.get("status") or "") != "active":
+        return None
+    return target
+
+
 def pick_account(
     exclude_ids: set[int] = None,
     provider: str = "workbuddy",
@@ -1378,8 +1437,14 @@ def pick_account(
 
     两道过滤都只调整优先级、不清空候选（能力过滤在有能力账号时生效，站点偏好在偏好
     站点有账号时生效），否则会出现「明明有账号，却报 No available accounts」。
+
+    最后：API Key 若绑定了账号（default_account>0），只返回那个账号。绑定优先于所有
+    调度规则 —— 它存在的意义就是让调用方指定用哪个账号。
     """
     exclude_ids = exclude_ids or set()
+    pinned = pinned_account_id()
+    if pinned:
+        return _pick_pinned_account(pinned, exclude_ids, provider)
     accounts = db.get_active_accounts(provider)
     candidates = [
         a for a in accounts
@@ -1426,6 +1491,22 @@ async def pick_account_with_fallback(
     account = pick_account(exclude_ids, provider=provider, model=model)
     if account:
         return account
+
+    pinned = pinned_account_id()
+    if pinned:
+        # 绑定了账号：只刷新这一个，不碰其它账号。
+        target = db.get_account(pinned)
+        if (
+            target
+            and str(target.get("provider") or "workbuddy") == provider
+            and pinned not in (exclude_ids or set())
+            and await refresh_token(target)
+        ):
+            fresh = db.get_account(pinned)
+            if fresh:
+                _set_sticky_account(fresh["id"], provider, model)
+            return fresh
+        return None
 
     expired_accounts = sorted(
         (
