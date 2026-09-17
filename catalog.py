@@ -77,16 +77,37 @@ def normalize_models(rows: Any) -> list[dict]:
     return models
 
 
-def extras_for(channel: str) -> list[dict]:
+def _raw_extras(channel: str) -> list:
     items = _load_map(EXTRAS_SETTING).get(channel)
-    if isinstance(items, list) and items:
-        return normalize_models(items)
-    return []
+    return list(items) if isinstance(items, list) else []
 
 
-def save_extras(channel: str, models: list[dict]) -> None:
+def _removal_markers(items: list) -> list[dict]:
+    """从原始 extras 里取出「已删除」标记项（官方模型被用户删掉时留下的墓碑）。"""
+    return [
+        {"id": str(item.get("id")), "removed": True}
+        for item in items
+        if isinstance(item, dict) and item.get("removed") and item.get("id")
+    ]
+
+
+def extras_for(channel: str) -> list[dict]:
+    """用户手动添加的模型；「已删除」标记项不算模型，单独处理。"""
+    items = [
+        item
+        for item in _raw_extras(channel)
+        if isinstance(item, dict) and not item.get("removed")
+    ]
+    return normalize_models(items)
+
+
+def removed_ids(channel: str) -> set[str]:
+    return {item["id"] for item in _removal_markers(_raw_extras(channel))}
+
+
+def save_extras(channel: str, items: list) -> None:
     extras = _load_map(EXTRAS_SETTING)
-    extras[channel] = normalize_models(models)
+    extras[channel] = list(items)
     db.set_setting(EXTRAS_SETTING, extras)
 
 
@@ -94,10 +115,22 @@ def _merge_models(base: list[dict], extra: list[dict]) -> list[dict]:
     return normalize_models(list(base) + list(extra))
 
 
+def _visible_models(channel: str, base: list[dict]) -> list[dict]:
+    """官方/回退目录 + 手动项，并剔除用户删掉的（带墓碑的）模型。"""
+    hidden = removed_ids(channel)
+    if hidden:
+        base = [
+            item
+            for item in base
+            if str((item.get("id") if isinstance(item, dict) else item) or "") not in hidden
+        ]
+    return _merge_models(base, extras_for(channel))
+
+
 def models_for(channel: str, fallback: list[dict]) -> list[dict]:
     stored = stored_catalog(channel)
     base = stored if stored else list(fallback)
-    return _merge_models(base, extras_for(channel))
+    return _visible_models(channel, base)
 
 
 def _with_manual(channel: str, models: list[dict]) -> list[dict]:
@@ -108,6 +141,11 @@ def _with_manual(channel: str, models: list[dict]) -> list[dict]:
         row["manual"] = str(row.get("id") or "") in extra_ids
         annotated.append(row)
     return annotated
+
+
+def _hidden_count(channel: str) -> int:
+    """被用户删除（打上墓碑）的官方模型数量，UI 用它显示「已删除 N」。"""
+    return len(removed_ids(channel))
 
 
 def _normalize_model_id(channel: str, model_id: str) -> str:
@@ -144,21 +182,50 @@ def upsert_model(channel: str, model_id: str, name: str = "") -> dict:
     if not mid:
         raise CatalogError("model id is required")
     label = str(name or "").strip() or mid
-    current = current_models(channel)
-    extra_ids = {str(item.get("id")) for item in extras_for(channel)}
-    current_ids = {str(item.get("id")) for item in current if isinstance(item, dict)}
+    raw = _raw_extras(channel)
+    markers = _removal_markers(raw)
+    manual = extras_for(channel)
+
+    # 之前被删除的官方模型：重新添加即恢复（去掉墓碑），而不是变成手动项。
+    if any(marker["id"] == mid for marker in markers):
+        markers = [marker for marker in markers if marker["id"] != mid]
+        save_extras(channel, markers + manual)
+        visible = {
+            str(item.get("id"))
+            for item in current_models(channel)
+            if isinstance(item, dict)
+        }
+        if mid not in visible:
+            # 上游目录已经不提供它了：作为手动项保底，否则这次「恢复」等于什么都没做。
+            manual = [item for item in manual if item.get("id") != mid]
+            manual.append({"id": mid, "name": label})
+            save_extras(channel, markers + manual)
+        models = current_models(channel)
+        return {
+            "channel": channel,
+            "id": mid,
+            "name": label,
+            "count": len(models),
+            "models": _with_manual(channel, models),
+            "updated": True,
+            "restored": True,
+        }
+
+    extra_ids = {str(item.get("id")) for item in manual}
+    current_ids = {
+        str(item.get("id")) for item in current_models(channel) if isinstance(item, dict)
+    }
     if mid in current_ids and mid not in extra_ids:
         raise CatalogError("model already exists in this channel")
-    extras = extras_for(channel)
     found = False
-    for item in extras:
+    for item in manual:
         if item.get("id") == mid:
             item["name"] = label
             found = True
             break
     if not found:
-        extras.append({"id": mid, "name": label})
-    save_extras(channel, extras)
+        manual.append({"id": mid, "name": label})
+    save_extras(channel, markers + manual)
     models = current_models(channel)
     return {
         "channel": channel,
@@ -171,15 +238,35 @@ def upsert_model(channel: str, model_id: str, name: str = "") -> dict:
 
 
 def remove_model(channel: str, model_id: str) -> dict:
+    """删除模型：手动项直接移除，官方项留「墓碑」——一键读取也不会把它带回来。"""
     channel = _require_enabled_channel(channel)
     mid = _normalize_model_id(channel, model_id)
     if not mid:
         raise CatalogError("model id is required")
-    extras = extras_for(channel)
-    kept = [item for item in extras if item.get("id") != mid]
-    if len(kept) == len(extras):
-        raise CatalogError("not a manually added model")
-    save_extras(channel, kept)
+    raw = _raw_extras(channel)
+    markers = _removal_markers(raw)
+    manual = extras_for(channel)
+    manual_ids = {str(item.get("id")) for item in manual}
+    visible_ids = {
+        str(item.get("id")) for item in current_models(channel) if isinstance(item, dict)
+    }
+    official_ids = visible_ids - manual_ids
+
+    if mid in manual_ids:
+        manual = [item for item in manual if item.get("id") != mid]
+    if mid in official_ids or any(marker["id"] == mid for marker in markers):
+        markers.append({"id": mid, "removed": True})
+    elif mid not in manual_ids:
+        raise CatalogError("model not found")
+
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for marker in markers:
+        if marker["id"] in seen:
+            continue
+        seen.add(marker["id"])
+        deduped.append(marker)
+    save_extras(channel, deduped + manual)
     models = current_models(channel)
     return {
         "channel": channel,
@@ -226,6 +313,7 @@ def _status_row(
         "mode": mode,
         "message": message,
         "count": len(models),
+        "hidden_count": _hidden_count(channel),
         "models": _with_manual(channel, models),
         "updated_at": int(time.time()),
     }
@@ -346,7 +434,7 @@ async def refresh_one(channel: str) -> dict:
     return _status_row(
         channel,
         mode="live",
-        models=_merge_models(fetched, extras_for(channel)),
+        models=_visible_models(channel, fetched),
         message="",
         display_name=display_name,
     )
@@ -394,6 +482,7 @@ def catalog_snapshot() -> dict:
                 "mode": meta.get("mode") or ("fallback" if channel not in LIVE_FETCHERS else "static"),
                 "message": meta.get("message") or "",
                 "count": len(models),
+                "hidden_count": _hidden_count(channel),
                 "models": _with_manual(channel, models),
                 "updated_at": meta.get("updated_at"),
             }

@@ -210,6 +210,9 @@ def test_admin_models_page_has_one_click_control():
     assert "addForm.channel" in html
     assert "/admin/models/catalogs" in html
     assert "submitAdd" in html
+    assert "rmExtra" in html
+    assert "restoreHidden" in html
+    assert "恢复已删除" in html
     assert "aliasChannel" in html
     assert "别名映射" in html
     assert "编辑模型" not in html
@@ -481,5 +484,54 @@ def test_manual_add_rejects_unknown_channel(isolated_db, all_channels):
         catalog.upsert_model("qwenwork", "qwork-advanced")
     with pytest.raises(catalog.CatalogError):
         catalog.upsert_model("workbuddy", "glm-5.2")
+    # 官方模型可以删（落墓碑隐藏），但不存在于任何列表的 id 仍然报错。
     with pytest.raises(catalog.CatalogError):
-        catalog.remove_model("workbuddy", "glm-5.2")
+        catalog.remove_model("qwenwork", "qwork-nonexistent")
+    with pytest.raises(catalog.CatalogError):
+        catalog.remove_model("workbuddy", "")
+
+
+def test_official_model_can_be_removed_and_restored(isolated_db, all_channels, monkeypatch):
+    """官方模型也要能删：删除落墓碑，一键读取不会带回来，重新添加同一个 ID 即恢复。"""
+    import catalog
+
+    workbuddy = providers.get_provider("workbuddy")
+    assert workbuddy.accepts_model("glm-5.2")
+
+    removed = catalog.remove_model("workbuddy", "glm-5.2")
+    assert "glm-5.2" not in _ids(removed["models"])
+    assert "glm-5.2" not in _ids(workbuddy.list_models())
+    assert not workbuddy.accepts_model("glm-5.2")
+    assert "glm-5.2" not in {item["id"] for item in server.collect_v1_models()}
+
+    # 一键读取（在线目录）不会把删掉的官方模型带回来。
+    _seed_live_accounts()
+    _install_supplier_http(monkeypatch)
+    monkeypatch.setattr(server, "ALLOW_NO_ADMIN_AUTH", True)
+    sources = _by_channel(asyncio.run(server.admin_refresh_models()))
+    wb_ids = _ids(sources["workbuddy"]["models"])
+    assert WB_NEW_ID in wb_ids
+    assert "glm-5.2" not in wb_ids
+    assert sources["workbuddy"]["hidden_count"] == 1
+    assert not workbuddy.accepts_model("glm-5.2")
+
+    # 手动添加过的模型：删除即移除，不会留下墓碑。
+    catalog.upsert_model("workbuddy", "wb-user-model", "WB user")
+    assert workbuddy.accepts_model("wb-user-model")
+    catalog.remove_model("workbuddy", "wb-user-model")
+    assert not workbuddy.accepts_model("wb-user-model")
+    assert "wb-user-model" not in catalog.removed_ids("workbuddy")
+
+    # 恢复：填回同一个 ID 即重新可见（墓碑被清掉，也不变成手动项）。
+    restored = catalog.upsert_model("workbuddy", "glm-5.2", "")
+    assert restored["restored"] is True
+    assert workbuddy.accepts_model("glm-5.2")
+    assert catalog.removed_ids("workbuddy") == set()
+    row = next(item for item in catalog.catalog_snapshot()["sources"][0]["models"] if item["id"] == "glm-5.2")
+    assert not row.get("manual")
+
+    # 删除是幂等的：重复删同一个官方模型只留一条墓碑。
+    catalog.remove_model("workbuddy", "glm-5.2")
+    catalog.remove_model("workbuddy", "glm-5.2")
+    assert catalog.removed_ids("workbuddy") == {"glm-5.2"}
+    assert "glm-5.2" not in _ids(workbuddy.list_models())

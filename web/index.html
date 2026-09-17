@@ -983,7 +983,7 @@ const app=createApp({
   </div><div class="modal-f"><button class="btn" @click="close">{{res?'关闭':'取消'}}</button><button class="btn pri" @click="create" v-if="!res" :disabled="saving">{{saving?'创建中':'创建'}}</button></div></div></div>
 </div>`
 }).component('mdls',{props:['token','toast'],setup(p){
-  const al=ref({}),builtinKeys=ref({}),aliasChannel=ref('workbuddy'),ld=ref(true),sources=ref([]),syncing=ref(false),adding=ref(false),addOpen=ref(false);
+  const al=ref({}),builtinKeys=ref({}),aliasChannel=ref('workbuddy'),ld=ref(true),sources=ref([]),syncing=ref(false),adding=ref(false),addOpen=ref(false),restoring=ref(false);
   // 站点偏好：同一个模型在国内站与国际站计费不同，而且方向不一定（deepseek-v4.1-flash
   // 国际站免费、国内站扣额度；glm-5.3 反过来国际站收费），所以默认交给 auto —— 从历史
   // 请求日志里学「哪边免费/更便宜」。空串=不区分。
@@ -1045,14 +1045,28 @@ const app=createApp({
       const label=(channels.value.find(c=>c.id===channel)||{}).display_name||channel;
       const bare=id.startsWith(channel+'/')?id.slice(channel.length+1):id;
       const r=await api.post('/admin/models/catalogs',{channel,id:bare,name},p.token);
-      p.toast((r.updated?'已更新 ':'已添加 ')+label);
+      p.toast(r.restored?'已恢复 '+label+' 的 '+bare:(r.updated?'已更新 ':'已添加 ')+label);
       addOpen.value=false;
       await refreshCatalogs();
     }catch(e){p.toast(apiErr(e,'添加失败'),'err')}
     adding.value=false
   }
   async function rmExtra(channel,id){
-    try{await api.del('/admin/models/catalogs?channel='+encodeURIComponent(channel)+'&model_id='+encodeURIComponent(id),p.token);p.toast('已删除');await refreshCatalogs()}catch(e){p.toast(apiErr(e,'删除失败'),'err')}
+    if(!confirm('从 '+channel+' 删除模型 '+id+' ？\n\n删除后一键读取也不会再把它带回来；需要时可在“添加模型”里重新填回同一个 ID 恢复。'))return;
+    try{await api.del('/admin/models/catalogs?channel='+encodeURIComponent(channel)+'&model_id='+encodeURIComponent(id),p.token);p.toast('已删除 '+id);await refreshCatalogs()}catch(e){p.toast(apiErr(e,'删除失败'),'err')}
+  }
+  async function restoreHidden(){
+    const hidden=modelSources.value.flatMap(s=>(s.models||[]).filter(x=>x.hidden).map(x=>({channel:s.channel,id:x.id})));
+    if(!hidden.length){p.toast('没有需要恢复的模型','warn');return}
+    if(!confirm('恢复全部已删除的官方模型（共 '+hidden.length+' 个）？'))return;
+    if(restoring.value)return;restoring.value=true;
+    let done=0,failed=0;
+    for(const item of hidden){
+      try{await api.post('/admin/models/catalogs',{channel:item.channel,id:item.id,name:''},p.token);done++}catch(e){failed++}
+    }
+    restoring.value=false;
+    await refreshCatalogs();
+    p.toast('已恢复 '+done+' 个'+(failed?'，失败 '+failed+' 个':''),failed?'warn':'ok');
   }
   function isBuiltin(k){return (builtinKeys.value[aliasChannel.value]||[]).includes(k)}
   function addAlias(){
@@ -1074,11 +1088,11 @@ const app=createApp({
   const aliasRows=computed(()=>al.value[aliasChannel.value]||{});
   const aliasTargets=computed(()=>{const s=modelSources.value.find(x=>x.channel===aliasChannel.value);return s?s.models:[]});
   const aliasChannelName=computed(()=>(channels.value.find(c=>c.id===aliasChannel.value)||{}).display_name||aliasChannel.value);
-  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,aliasChannel,aliasRows,aliasTargets,aliasChannelName,sitePref,siteDefault,siteGroups,siteRows,siteFor,setSiteFor,saveSitePref,I}
+  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,restoring,restoreHidden,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,aliasChannel,aliasRows,aliasTargets,aliasChannelName,sitePref,siteDefault,siteGroups,siteRows,siteFor,setSiteFor,saveSitePref,I}
 },template:`
 <div>
   <div class="phead"><h1>模型配置</h1><p>四通道目录均来自上游或本地回退；自定义模型用“添加模型”，官方条目不改名</p></div>
-  <div class="tbar"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></div>
+  <div class="tbar"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="restoreHidden" :disabled="restoring">{{restoring?'恢复中':'恢复已删除'}}</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></div>
   <div class="card" v-if="sources.length" style="margin-bottom:12px"><div class="card-h">各通道供应模型<span class="sub">在线读取或回退本地/后台列表，互不合并</span></div>
     <table><thead><tr><th>通道</th><th>方式</th><th>数量</th><th>说明</th></tr></thead><tbody>
     <tr v-for="s in sources" :key="s.channel"><td>{{s.display_name||s.channel}} <span class="tag">{{s.channel}}</span></td><td><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></td><td>{{s.count||0}}</td><td class="mono" style="color:var(--fg3)">{{s.message||'—'}}</td></tr>
@@ -1098,20 +1112,21 @@ const app=createApp({
     </tbody></table></div>
   </div>
   <div class="card" v-for="s in modelSources" :key="'cat-'+s.channel" style="margin-bottom:12px">
-    <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{s.models.length}} 个模型</span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></div>
-    <div class="hint" style="padding:8px 16px">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项可删除。</div>
-    <table><thead><tr><th>模型 ID</th><th>名称</th><th>操作</th></tr></thead><tbody>
+    <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{s.models.length}} 个模型<span v-if="s.hidden_count"> · 已删除 {{s.hidden_count}}</span></span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></div>
+    <div class="hint" style="padding:8px 16px">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项和不需要的官方模型都能删，删除后一键读取不会带回来。手动项标<span class="tag">手动</span>，恢复回来的官方项标<span class="tag warn">已删除</span>。</div>
+    <table><thead><tr><th>模型 ID</th><th>名称</th><th>来源</th><th>操作</th></tr></thead><tbody>
     <tr v-for="(x,i) in s.models" :key="s.channel+'-'+i">
-      <td class="mono">{{s.channel}}/{{x.id}} <span v-if="x.manual" class="tag">手动</span></td>
+      <td class="mono">{{s.channel}}/{{x.id}}</td>
       <td>{{x.name||x.id}}</td>
-      <td><button v-if="x.manual" class="btn s danger" @click="rmExtra(s.channel,x.id)">删除</button><span v-else class="muted">—</span></td>
+      <td><span v-if="x.hidden" class="tag warn">已删除</span><span v-else-if="x.manual" class="tag">手动</span><span v-else class="muted">官方</span></td>
+      <td><button class="btn s danger" @click="rmExtra(s.channel,x.id)">{{x.hidden?'取消删除':'删除'}}</button></td>
     </tr>
-    <tr v-if="!s.models.length"><td colspan="3" class="empty">暂无模型</td></tr>
+    <tr v-if="!s.models.length"><td colspan="4" class="empty">暂无模型</td></tr>
     </tbody></table>
   </div>
   <div class="ov" v-if="addOpen" @click.self="closeAdd"><div class="modal"><div class="modal-h"><h3>添加模型</h3><button class="x" @click="closeAdd">&times;</button></div><div class="modal-b">
     <div class="field"><label>通道</label><select v-model="addForm.channel"><option v-for="c in channels" :key="c.id" :value="c.id">{{c.display_name||c.id}}</option></select><div class="hint">模型名称只加入所选通道，不会出现在其它通道。</div></div>
-    <div class="field"><label>模型 ID</label><input v-model="addForm.id" placeholder="如 qwork-advanced 或 Doubao-Seed-2.2-Pro" @keydown.enter="submitAdd"/><div class="hint">填写上游实际模型 id；可带通道前缀，会自动去掉。</div></div>
+    <div class="field"><label>模型 ID</label><input v-model="addForm.id" placeholder="如 qwork-advanced 或 Doubao-Seed-2.2-Pro" @keydown.enter="submitAdd"/><div class="hint">填写上游实际模型 id；可带通道前缀，会自动去掉。填之前删除过的官方 ID 即可恢复它。</div></div>
     <div class="field"><label>显示名称</label><input v-model="addForm.name" placeholder="可选，默认与 ID 相同" @keydown.enter="submitAdd"/></div>
   </div><div class="modal-f"><button class="btn" @click="closeAdd">取消</button><button class="btn pri" @click="submitAdd" :disabled="adding">{{adding?'添加中':'添加'}}</button></div></div></div>
   <div v-if="ld" class="load"><div class="spin"></div></div>
