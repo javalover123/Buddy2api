@@ -350,7 +350,18 @@ table{font-size:12px}.table-scroll{background:#fff}th{padding:9px 12px;backgroun
    固定后两列宽度，让「模型 ID」吃掉剩余宽度，下拉框列跟表头对齐且足够宽。 */
 .site-table th:nth-child(2),.site-table td:nth-child(2){width:170px}
 .site-table th:nth-child(3),.site-table td:nth-child(3){width:300px}
-.site-table .selectctl{width:100%;max-width:260px}
+/* 站点偏好自定义下拉：button 模拟 select，浮层 fixed 定位避免被表格容器裁剪。 */
+.site-btn{width:100%;max-width:260px;display:flex;justify-content:space-between;align-items:center;gap:8px;text-align:left;cursor:pointer}
+.site-btn .chev{flex-shrink:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid #8a8982}
+.site-menu{position:fixed;z-index:60;width:264px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 10px 32px rgba(0,0,0,.16);padding:4px;display:flex;flex-direction:column;gap:1px}
+.site-opt{display:flex;justify-content:space-between;align-items:center;border:0;background:none;text-align:left;padding:8px 10px;border-radius:5px;font:inherit;font-size:12px;color:var(--fg);cursor:pointer}
+.site-opt:hover{background:var(--hover)}
+.site-opt.on{background:var(--accent-soft);color:var(--accent-strong);font-weight:600}
+.site-opt .opt-check{font-size:11px}
+/* 操作按钮行：说明文字在左、按钮组在右，小屏堆叠。 */
+.card-ops{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 16px;flex-wrap:wrap}
+.card-ops .ops-text{flex:1;min-width:260px}
+.card-ops .ops-btns{display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap}
 .seg{border-radius:6px;background:#fff}.seg button{background:#fff}.seg button.on{background:#3f3f3d;color:#fff}
 .codeblk{background:#242321;color:#d8d4cc;border-color:#383632;border-radius:6px}.codeblk .k{color:#ff8a48}.codeblk .s{color:#ffd19a}
 .callout{background:#f7f7f4}.quick-row .qv,.info-row .v{background:#f5f5f2}.setup-tabs button{border-radius:6px}.setup-tabs button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -1008,6 +1019,22 @@ const app=createApp({
   function applySitePref(snap){const models={...(snap&&snap.models||{})};sitePref.value={default:(snap&&snap.default)||'auto',models};siteDefault.value=(snap&&snap.default)||'auto'}
   function siteFor(id){return sitePref.value.models[id]||''}
   function setSiteFor(id,v){const models={...sitePref.value.models};if(v)models[id]=v;else delete models[id];sitePref.value={default:sitePref.value.default,models}}
+  // 站点偏好列用自定义下拉：原生 select 的弹出层与控件错位、且被选项文字撑得很宽，观感割裂。
+  // 浮层 fixed 定位到按钮下方；任意点击或页面/表格滚动时关闭，避免错位后还挂在原地。
+  const siteMenu=ref(''),siteMenuPos=ref({top:0,left:0});
+  function siteLabel(v){const g=siteGroups.find(x=>x.id===v);return v&&g?g.label:'不区分'}
+  function closeSiteMenu(){siteMenu.value=''}
+  function openSiteMenu(id,ev){
+    if(siteMenu.value===id){closeSiteMenu();return}
+    const r=ev.currentTarget.getBoundingClientRect();
+    siteMenuPos.value={top:r.bottom+4,left:Math.max(8,Math.min(r.left,window.innerWidth-280))};
+    siteMenu.value=id;
+    setTimeout(()=>{
+      document.addEventListener('click',closeSiteMenu,{once:true});
+      window.addEventListener('scroll',closeSiteMenu,{once:true,capture:true,passive:true});
+    },0);
+  }
+  function pickSite(id,v){setSiteFor(id,v);closeSiteMenu()}
   async function saveSitePref(){
     try{
       const r=await api.put('/admin/site-preference',{default:siteDefault.value||'',models:sitePref.value.models},p.token);
@@ -1093,7 +1120,7 @@ const app=createApp({
   const aliasRows=computed(()=>al.value[aliasChannel.value]||{});
   const aliasTargets=computed(()=>{const s=modelSources.value.find(x=>x.channel===aliasChannel.value);return s?s.models:[]});
   const aliasChannelName=computed(()=>(channels.value.find(c=>c.id===aliasChannel.value)||{}).display_name||aliasChannel.value);
-  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,restoring,restoreHidden,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,aliasChannel,aliasRows,aliasTargets,aliasChannelName,sitePref,siteDefault,siteGroups,siteRows,siteFor,setSiteFor,saveSitePref,I}
+  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,restoring,restoreHidden,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,aliasChannel,aliasRows,aliasTargets,aliasChannelName,sitePref,siteDefault,siteGroups,siteRows,siteFor,siteMenu,siteMenuPos,siteLabel,openSiteMenu,closeSiteMenu,pickSite,saveSitePref,I}
 },template:`
 <div>
   <div class="phead"><h1>模型配置</h1><p>四通道目录均来自上游或本地回退；自定义模型用“添加模型”，官方条目不改名</p></div>
@@ -1111,14 +1138,13 @@ const app=createApp({
       <button class="btn s pri" @click="saveSitePref">保存站点偏好</button>
     </div>
     <div class="table-scroll"><table class="site-table"><thead><tr><th>模型 ID</th><th>通道</th><th>站点偏好</th></tr></thead><tbody>
-    <tr v-for="x in siteRows" :key="'site-'+x.id"><td class="mono">{{x.id}}</td><td><span class="tag">{{x.channel}}</span></td><td><select class="selectctl" :value="siteFor(x.id)" @change="setSiteFor(x.id,$event.target.value)" :aria-label="'站点偏好 '+x.id"><option v-for="g in siteGroups" :key="x.id+'-'+g.id" :value="g.id">{{g.label}}</option></select></td></tr>
+    <tr v-for="x in siteRows" :key="'site-'+x.id"><td class="mono">{{x.id}}</td><td><span class="tag">{{x.channel}}</span></td><td><button type="button" class="selectctl site-btn" @click="openSiteMenu(x.id,$event)" :aria-label="'站点偏好 '+x.id" :aria-expanded="siteMenu===x.id"><span>{{siteLabel(siteFor(x.id))}}</span><span class="chev" aria-hidden="true"></span></button></td></tr>
     <tr v-if="!siteRows.length"><td colspan="3" class="empty">暂无模型</td></tr>
     </tbody></table></div>
   </div>
-  <div class="tbar"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="restoreHidden" :disabled="restoring">{{restoring?'恢复中':'恢复已删除'}}</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></div>
   <div class="card" v-for="s in modelSources" :key="'cat-'+s.channel" style="margin-bottom:12px">
     <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{s.models.length}} 个模型<span v-if="s.hidden_count"> · 已删除 {{s.hidden_count}}</span></span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></div>
-    <div class="hint" style="padding:8px 16px">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项和不需要的官方模型都能删，删除后一键读取不会带回来。手动项标<span class="tag">手动</span>，恢复回来的官方项标<span class="tag warn">已删除</span>。</div>
+    <div class="hint card-ops"><span class="ops-text">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项和不需要的官方模型都能删，删除后一键读取不会带回来。手动项标<span class="tag">手动</span>，恢复回来的官方项标<span class="tag warn">已删除</span>。</span><span class="ops-btns"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="restoreHidden" :disabled="restoring">{{restoring?'恢复中':'恢复已删除'}}</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></span></div>
     <table><thead><tr><th>模型 ID</th><th>名称</th><th>来源</th><th>操作</th></tr></thead><tbody>
     <tr v-for="(x,i) in s.models" :key="s.channel+'-'+i">
       <td class="mono">{{s.channel}}/{{x.id}}</td>
@@ -1128,6 +1154,9 @@ const app=createApp({
     </tr>
     <tr v-if="!s.models.length"><td colspan="4" class="empty">暂无模型</td></tr>
     </tbody></table>
+  </div>
+  <div class="site-menu" v-if="siteMenu" :style="{top:siteMenuPos.top+'px',left:siteMenuPos.left+'px'}" @click.stop role="menu">
+    <button type="button" v-for="g in siteGroups" :key="'opt-'+g.id" class="site-opt" :class="{on:(siteMenu?siteFor(siteMenu):'')===g.id}" @click="pickSite(siteMenu,g.id)" role="menuitem">{{g.label}}<span v-if="(siteMenu?siteFor(siteMenu):'')===g.id" class="opt-check" aria-hidden="true">✓</span></button>
   </div>
   <div class="ov" v-if="addOpen" @click.self="closeAdd"><div class="modal"><div class="modal-h"><h3>添加模型</h3><button class="x" @click="closeAdd">&times;</button></div><div class="modal-b">
     <div class="field"><label>通道</label><select v-model="addForm.channel"><option v-for="c in channels" :key="c.id" :value="c.id">{{c.display_name||c.id}}</option></select><div class="hint">模型名称只加入所选通道，不会出现在其它通道。</div></div>
