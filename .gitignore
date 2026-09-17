@@ -64,6 +64,7 @@ CHANGELOG.md
 PRODUCT_IMPROVEMENT_DESIGN.md
 codebuddy2openai_协议逆向完整文档.md
 _mimo-backup-*/
+notes/
 *.har
 *.pcap
 *.pcapng
