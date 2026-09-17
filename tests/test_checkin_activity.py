@@ -21,6 +21,7 @@
 """
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -260,3 +261,42 @@ def test_real_failure_still_counts_as_failed(isolated_db, monkeypatch):
 
     assert summary["failed"] == 1
     assert summary["unavailable"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 管理页提示：单账号「领取」按钮与一键领取必须用同一套文案
+# ---------------------------------------------------------------------------
+
+
+def _index_html() -> str:
+    return (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text(encoding="utf-8")
+
+
+def test_claim_one_toast_distinguishes_inactive_activity():
+    """单账号「领取」的 toast 也要认 unavailable。
+
+    回归：一键领取补了 unavailable 分支，但 `claimOne` 的 toast 仍是
+    `r.claimed?'领取成功':(r.already_claimed?'今日已领':'领取失败')`，
+    于是国际站账号点单个「领取」仍弹红字「领取失败」——同一件事两个入口两种结论。
+    """
+    html = _index_html()
+    line = next(
+        (ln for ln in html.splitlines() if ln.startswith("  async function claimOne(a)")),
+        None,
+    )
+    assert line, "未找到 claimOne 定义"
+    assert "r.unavailable||r.active===false" in line, (
+        "claimOne 的 toast 必须区分「活动未开启」，否则会误报领取失败"
+    )
+    assert "'签到活动未开启或已过期'" in line
+
+
+def test_claim_text_and_one_click_summary_share_the_wording():
+    """claimText 与一键领取汇总的措辞保持一致，避免同一状态两种说法。"""
+    html = _index_html()
+    text_line = next(
+        (ln for ln in html.splitlines() if ln.startswith("  function claimText(r)")),
+        None,
+    )
+    assert text_line and "r.unavailable||r.active===false" in text_line
+    assert "claim.summary.unavailable" in html, "一键领取弹窗应单列「活动未开启/已过期」"
