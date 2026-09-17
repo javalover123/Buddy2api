@@ -24,10 +24,10 @@ import asyncio
 
 import pytest
 
-import auth_manager
-import control_plane
-import credential_crypto
-import database as db
+import buddy2api.auth_manager as auth_manager
+import buddy2api.control_plane as control_plane
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
 
 INTL_DOMAIN = "www.workbuddy.ai"
 CN_DOMAIN = "www.codebuddy.cn"

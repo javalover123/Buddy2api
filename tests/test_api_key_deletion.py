@@ -18,10 +18,10 @@ import time
 
 import pytest
 
-import auth_manager
-import control_plane
-import credential_crypto
-import database as db
+import buddy2api.auth_manager as auth_manager
+import buddy2api.control_plane as control_plane
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
 
 
 @pytest.fixture()
@@ -134,8 +134,6 @@ def test_import_update_preserves_account_extra(isolated_db, tmp_path, monkeypatc
     否则账号上的 route_exclude 等附属标记会在每次重启时被静默抹掉
     （_TOKEN_FIELDS 含 extra，而解析结果只带本次的 auth_path）。
     """
-    import control_plane
-
     info = tmp_path / "a.info"
     info.write_text(
         '{"account":{"uid":"u-extra","nickname":"n"},"auth":{"accessToken":"tok","refreshToken":"ref"}}',
