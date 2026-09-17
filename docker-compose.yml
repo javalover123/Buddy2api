@@ -7,8 +7,8 @@ services:
     volumes:
       # 持久化数据库
       - ./data:/app/data
-      # Windows 推荐直接运行 .\start-docker-win.ps1 自动挂载登录目录
-      # WSL 推荐运行 ./start-docker-wsl.sh 自动挂载 /mnt/c 下的登录目录
+      # Windows 推荐直接运行 .\scripts\start-docker-win.ps1 自动挂载登录目录
+      # WSL 推荐运行 ./scripts/start-docker-wsl.sh 自动挂载 /mnt/c 下的登录目录
     environment:
       - CB_GATEWAY_ADMIN_TOKEN=${CB_GATEWAY_ADMIN_TOKEN:?Set a strong CB_GATEWAY_ADMIN_TOKEN}
       - CB_GATEWAY_MASTER_KEY=${CB_GATEWAY_MASTER_KEY:-}

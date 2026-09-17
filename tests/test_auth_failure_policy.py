@@ -4,9 +4,9 @@ import asyncio
 
 import pytest
 
-import auth_manager
-import credential_crypto
-import database as db
+import buddy2api.auth_manager as auth_manager
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
 
 
 @pytest.fixture()

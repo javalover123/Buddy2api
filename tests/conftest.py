@@ -11,8 +11,8 @@ DB 路径，于是每跑一次测试就往真实库的 `logs` 表写一条 `acco
 
 import pytest
 
-import credential_crypto
-import database as db
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
 
 
 @pytest.fixture(autouse=True)

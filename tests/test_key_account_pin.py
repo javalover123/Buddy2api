@@ -16,9 +16,9 @@ import json
 
 import pytest
 
-import auth_manager
-import credential_crypto
-import database as db
+import buddy2api.auth_manager as auth_manager
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
 
 
 @pytest.fixture()
@@ -221,7 +221,7 @@ def test_fallback_gives_up_when_pinned_refresh_fails(clean_routing, monkeypatch)
 
 def test_apply_key_account_pin_sets_contextvar(clean_routing):
     """请求入口把 Key 的 default_account 写进 contextvar，选号才能看到。"""
-    import server
+    import buddy2api.server as server
 
     server._apply_key_account_pin({"default_account": 7})
     assert auth_manager.pinned_account_id() == 7
@@ -234,7 +234,7 @@ def test_apply_key_account_pin_sets_contextvar(clean_routing):
 
 
 def test_validate_key_account_rejects_unknown_and_wrong_channel(clean_routing):
-    import server
+    import buddy2api.server as server
     from fastapi import HTTPException
 
     aid = _add_account("cn", "u-cn", provider="workbuddy")
@@ -259,7 +259,7 @@ def test_validate_key_account_rejects_unknown_and_wrong_channel(clean_routing):
 def test_admin_create_key_validates_and_returns_default_account(clean_routing, monkeypatch):
     import asyncio
 
-    import server
+    import buddy2api.server as server
 
     aid = _add_account("cn", "u-cn")
     monkeypatch.setattr(server, "_check_admin", lambda *_a, **_k: None)
@@ -287,7 +287,7 @@ def test_admin_update_key_validates_against_effective_channel(clean_routing, mon
     """只改 default_account 时，校验要用该 Key 现有的通道，不能当成 workbuddy 放行。"""
     import asyncio
 
-    import server
+    import buddy2api.server as server
     from fastapi import HTTPException
 
     qwen = _add_account("qw", "u-qw", provider="qwenwork")

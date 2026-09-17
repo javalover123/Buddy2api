@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-import server
+import buddy2api.server as server
 
 
 @pytest.fixture
@@ -98,12 +98,13 @@ def unused_port():
 
 
 def test_repeated_start_and_restart(tmp_path):
-    root = Path(server.__file__).parent
+    # 包布局：server.py 现在在 buddy2api/ 内，从项目根用 `python -m buddy2api` 启动。
+    root = Path(server.__file__).resolve().parent.parent
     port = unused_port()
     env = os.environ.copy()
     env.pop("CB_GATEWAY_ADMIN_TOKEN", None)
     env.update(CB_GATEWAY_DB_PATH=str(tmp_path / "gateway.db"), CB_GATEWAY_AUTO_IMPORT="0", CB_GATEWAY_PROVIDERS="workbuddy", CB_AUTH_DIR=str(tmp_path / "no-auth"))
-    command = [sys.executable, "server.py", "--no-browser", "--port", str(port)]
+    command = [sys.executable, "-m", "buddy2api", "--no-browser", "--port", str(port)]
     with httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=1) as client:
         # Keep the browser's old credentials across process restarts.
         client.cookies.set("cb_gw_admin_token", "stale")
@@ -140,7 +141,7 @@ def test_remote_listener_requires_explicit_token(tmp_path):
     env = os.environ.copy()
     env.pop("CB_GATEWAY_ADMIN_TOKEN", None)
     env["CB_GATEWAY_DB_PATH"] = str(tmp_path / "never-created.db")
-    result = subprocess.run([sys.executable, server.__file__, "--host", "0.0.0.0", "--no-browser"], env=env, capture_output=True, text=True, timeout=20)
+    result = subprocess.run([sys.executable, "-m", "buddy2api", "--host", "0.0.0.0", "--no-browser"], cwd=Path(server.__file__).resolve().parent.parent, env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode != 0
     assert "Remote access requires" in result.stderr
     assert not (tmp_path / "never-created.db").exists()

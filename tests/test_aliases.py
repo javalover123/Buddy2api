@@ -4,13 +4,13 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
-import aliases
-import credential_crypto
-import database as db
-import providers
-import router
-import server
-from providers.protocol import UnknownModel
+import buddy2api.aliases as aliases
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
+import buddy2api.providers as providers
+import buddy2api.router as router
+import buddy2api.server as server
+from buddy2api.providers.protocol import UnknownModel
 
 
 @pytest.fixture()

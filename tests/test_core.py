@@ -8,13 +8,13 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
-import credential_crypto
-import database as db
-import proxy
-import reasoning_controls
-import responses
-import server
-import auth_manager
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
+import buddy2api.proxy as proxy
+import buddy2api.reasoning_controls as reasoning_controls
+import buddy2api.responses as responses
+import buddy2api.server as server
+import buddy2api.auth_manager as auth_manager
 
 
 def _chat_sse(payload: dict) -> bytes:
@@ -868,12 +868,14 @@ def test_plaintext_legacy_api_key_is_migrated_to_encrypted_storage(
 
 
 def test_windows_start_script_bootstraps_portable_buddy2api_environment():
-    script = (Path(__file__).parents[1] / "start.bat").read_bytes().decode("ascii")
+    script = (Path(__file__).parents[1] / "scripts" / "start.bat").read_bytes().decode("ascii")
 
     assert "create -n buddy2api python=3.12 -y" in script
     assert "run -n buddy2api python -m pip install -r requirements.txt" in script
-    assert "run --no-capture-output -n buddy2api python server.py" in script
+    assert "run --no-capture-output -n buddy2api python -m buddy2api" in script
     assert "-m venv .venv" in script
+    # 脚本在 scripts/ 下，必须先回到项目根再建 .venv / 跑包，否则会建到 scripts/ 里。
+    assert 'cd /d "%~dp0.."' in script
 
 
 def test_record_request_updates_log_and_counters_once(isolated_db):
@@ -3205,7 +3207,7 @@ def test_valid_headers_is_async_and_uses_decrypted_token(isolated_db):
         }
     )
     account = db.get_account(account_id)
-    headers = asyncio.run(__import__("auth_manager").get_valid_headers(account))
+    headers = asyncio.run(auth_manager.get_valid_headers(account))
     assert headers["Authorization"] == "Bearer access-secret"
 
 

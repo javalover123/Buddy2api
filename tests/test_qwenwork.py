@@ -3,15 +3,15 @@ from pathlib import Path
 
 import pytest
 
-import credential_crypto
-import database as db
-import providers
-import router
-from providers.protocol import UnknownChannel, UnknownModel
-from providers.qwenwork import cosy
-from providers.qwenwork.chat import build_body, envelope_error, unwrap_sse_payload
-from providers.qwenwork.constants import COSY_VERSION, COSY_VERSION_FROZEN, RSA_PUBLIC_KEY_PEM, STATIC_MODELS
-from providers.qwenwork.store import parse_credentials, qwenwork_auth_dirs
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
+import buddy2api.providers as providers
+import buddy2api.router as router
+from buddy2api.providers.protocol import UnknownChannel, UnknownModel
+from buddy2api.providers.qwenwork import cosy
+from buddy2api.providers.qwenwork.chat import build_body, envelope_error, unwrap_sse_payload
+from buddy2api.providers.qwenwork.constants import COSY_VERSION, COSY_VERSION_FROZEN, RSA_PUBLIC_KEY_PEM, STATIC_MODELS
+from buddy2api.providers.qwenwork.store import parse_credentials, qwenwork_auth_dirs
 
 
 @pytest.fixture()
@@ -104,7 +104,7 @@ def test_parse_credentials_requires_token():
 
 
 def test_qwenwork_quota_remaining_nested():
-    from providers.qwenwork import _quota_remaining
+    from buddy2api.providers.qwenwork import _quota_remaining
 
     assert _quota_remaining({"quota": {"remaining": 88}}) == 88
     assert _quota_remaining({"plan": {"credits": 12}}) == 12
@@ -130,7 +130,7 @@ def test_bind_qwenwork_disabled_is_unknown_channel(monkeypatch):
 
 
 def test_qwenwork_sources_do_not_touch_workbuddy_stack():
-    root = Path(__file__).resolve().parents[1] / "providers" / "qwenwork"
+    root = Path(__file__).resolve().parents[1] / "buddy2api" / "providers" / "qwenwork"
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert "copilot.tencent.com" not in text
@@ -175,7 +175,7 @@ def test_static_models_include_live_and_legacy_ids():
 
 
 def test_parse_qwenwork_supplier_models():
-    from providers.qwenwork.models import parse_supplier_models
+    from buddy2api.providers.qwenwork.models import parse_supplier_models
 
     models = parse_supplier_models(
         {

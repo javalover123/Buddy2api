@@ -2,10 +2,10 @@ import asyncio
 
 import pytest
 
-import control_plane
-import credential_crypto
-import database as db
-import auth_manager
+import buddy2api.control_plane as control_plane
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
+import buddy2api.auth_manager as auth_manager
 
 
 @pytest.fixture()
@@ -21,7 +21,7 @@ def isolated_db(tmp_path, monkeypatch):
 
 def test_create_key_requires_channel(isolated_db):
     from fastapi import HTTPException
-    import server
+    import buddy2api.server as server
 
     with pytest.raises(HTTPException) as err:
         server._validate_key_channel("")
@@ -132,8 +132,8 @@ def test_credit_summary_qclaw_uses_token_unit(isolated_db, monkeypatch):
             "status": "active",
         }
     )
-    from providers.protocol import QuotaSnapshot
-    from providers.qclaw import PROVIDER
+    from buddy2api.providers.protocol import QuotaSnapshot
+    from buddy2api.providers.qclaw import PROVIDER
 
     async def fake_quota(account):
         return QuotaSnapshot(

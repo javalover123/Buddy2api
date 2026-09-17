@@ -4,9 +4,9 @@ import json
 import pytest
 from fastapi import HTTPException
 
-import providers
-import router
-from providers.protocol import (
+import buddy2api.providers as providers
+import buddy2api.router as router
+from buddy2api.providers.protocol import (
     InvalidModel,
     KeyChannelMismatch,
     UnknownChannel,
@@ -162,7 +162,7 @@ def test_responses_after_bind_dispatches_to_selected_provider(qwen_enabled, monk
     async def fail_workbuddy(*_args, **_kwargs):
         raise AssertionError("Responses bypassed the selected provider")
 
-    monkeypatch.setattr("proxy.proxy_chat_completions", fail_workbuddy)
+    monkeypatch.setattr("buddy2api.proxy.proxy_chat_completions", fail_workbuddy)
     bound = router.bind(
         {"model": "qwenwork/qwork-advanced"},
         {"default_channel": "qwenwork"},

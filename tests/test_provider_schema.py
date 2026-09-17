@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 
-import credential_crypto
-import database as db
-import auth_manager
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
+import buddy2api.auth_manager as auth_manager
 
 
 @pytest.fixture()
@@ -19,7 +19,7 @@ def isolated_db(tmp_path, monkeypatch):
 
 
 def test_default_registry_enables_wave1_channels(monkeypatch):
-    import providers
+    import buddy2api.providers as providers
 
     monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
     assert providers.enabled_provider_ids() == ["workbuddy", "qclaw", "qwenwork", "traework"]

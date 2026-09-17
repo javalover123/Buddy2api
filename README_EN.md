@@ -15,7 +15,7 @@ Buddy2api listens on `http://127.0.0.1:8787/v1`. You stay signed into the offici
 All four channels are on by default. A channel with no local login shows empty on Accounts; nothing is imported until you click Import.
 
 ```powershell
-python server.py
+python -m buddy2api
 ```
 
 | Channel | Default | Where logins live |
@@ -36,7 +36,7 @@ Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
 
    Note: that failure currently shares the same error as “no usable account in the channel” (503 `channel_unavailable`), so when you see it, check whether the pinned account is the one that went down.
 3. **HTTP 503 `channel_unavailable`** means that channel has no imported account.
-4. **Run QClaw / QwenWork with `python server.py` on Windows.** A Linux Docker container cannot decrypt those DPAPI files; the UI says so. WorkBuddy can stay on Docker.
+4. **Run QClaw / QwenWork with `python -m buddy2api` on Windows.** A Linux Docker container cannot decrypt those DPAPI files; the UI says so. WorkBuddy can stay on Docker.
 5. If the chat client is itself in Docker, Base URL is `http://host.docker.internal:8787/v1`.
 
 ## Install
@@ -53,20 +53,20 @@ conda create -n buddy2api python=3.12 -y
 conda activate buddy2api
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python server.py
+python -m buddy2api
 ```
 
 3. Open http://127.0.0.1:8787 → Accounts → Detect → Import → Test → API Keys (select a channel; pick Codex if the client is Codex) → point your client at `http://127.0.0.1:8787/v1`.
 
-Windows script: `.\start.bat`. Docker helper: `.\start-docker-win.ps1` (WorkBuddy mount; use native Python for QClaw/QwenWork).
+Windows script: `.\scripts\start.bat`. Docker helper: `.\scripts\start-docker-win.ps1` (WorkBuddy mount; use native Python for QClaw/QwenWork).
 
-Later starts: `conda activate buddy2api` then `python server.py` in the project directory.
+Later starts: `conda activate buddy2api` then `python -m buddy2api` in the project directory.
 
 ## FAQ
 
 - `conda` not found: use Miniconda Prompt, or `conda init powershell` and reopen the terminal.
 - `No module named ...`: activate `buddy2api`, then `python -m pip install -r requirements.txt`.
-- Port 8787 in use: stop the old process or `python server.py --port 8788`.
+- Port 8787 in use: stop the old process or `python -m buddy2api --port 8788`.
 - No accounts in the UI: import has not been run yet.
 - Key create fails: the channel dropdown is required.
 - 503 `channel_unavailable`: the key's channel has no usable account; if the key is pinned to a specific account, the pinned account may be the one unavailable (disabled / cooling down / wrong channel). Re-pin it, or clear the pin to return to automatic routing.
