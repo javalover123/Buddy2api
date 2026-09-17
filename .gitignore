@@ -79,10 +79,11 @@ _mimo-backup-*/
 Thumbs.db
 desktop.ini
 
-# ±¾µØÔËĞĞÊ±¼ÇÒä/²úÎï
+# æœ¬åœ°è¿è¡Œæ—¶è®°å¿†/äº§ç‰©
 .workbuddy/
 .workbuddy-ai/
 .debug/
+.playwright-mcp/
 
 # Ant Code composer uploads
 ant-code-uploads/
