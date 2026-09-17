@@ -4,15 +4,15 @@ from pathlib import Path
 
 import pytest
 
-import credential_crypto
-import database as db
-import providers
-import router
-from providers.protocol import KeyChannelMismatch, UnknownChannel, UnknownModel
-from providers.qclaw.constants import JPRX_SIGNATURE_KEY, STATIC_MODELS
-from providers.qclaw.chat import _build_body, fill_empty_content
-from providers.qclaw.sign import aizone_headers, jprx_ctx
-from providers.qclaw.store import parse_credentials, qclaw_auth_dirs
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
+import buddy2api.providers as providers
+import buddy2api.router as router
+from buddy2api.providers.protocol import KeyChannelMismatch, UnknownChannel, UnknownModel
+from buddy2api.providers.qclaw.constants import JPRX_SIGNATURE_KEY, STATIC_MODELS
+from buddy2api.providers.qclaw.chat import _build_body, fill_empty_content
+from buddy2api.providers.qclaw.sign import aizone_headers, jprx_ctx
+from buddy2api.providers.qclaw.store import parse_credentials, qclaw_auth_dirs
 
 
 @pytest.fixture()
@@ -34,7 +34,7 @@ def qclaw_enabled(monkeypatch):
 
 
 def test_parse_today_tokens_used_and_limit():
-    from providers.qclaw.quota import parse_today_tokens
+    from buddy2api.providers.qclaw.quota import parse_today_tokens
 
     used, limit, remaining = parse_today_tokens({"today_used": 12, "today_limit": 100})
     assert used == 12
@@ -54,7 +54,7 @@ def test_qclaw_quota_uses_token_unit(qclaw_enabled, monkeypatch):
     async def fake_today_tokens(account):
         return {"used": 20, "limit": 80}
 
-    monkeypatch.setattr("providers.qclaw.quota.today_tokens", fake_today_tokens)
+    monkeypatch.setattr("buddy2api.providers.qclaw.quota.today_tokens", fake_today_tokens)
     snapshot = asyncio.run(providers.get_provider("qclaw").fetch_quota({"id": 1}))
     assert snapshot.unit == "token"
     assert snapshot.remaining == 60
@@ -163,7 +163,7 @@ def test_bind_qclaw_disabled_is_unknown_channel(monkeypatch):
 
 
 def test_qclaw_sources_do_not_touch_workbuddy_stack():
-    root = Path(__file__).resolve().parents[1] / "providers" / "qclaw"
+    root = Path(__file__).resolve().parents[1] / "buddy2api" / "providers" / "qclaw"
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert "copilot.tencent.com" not in text
@@ -186,7 +186,7 @@ def test_qclaw_auth_dirs_ignore_workbuddy_cb_auth_dir(monkeypatch, tmp_path):
 
 
 def test_upsert_qclaw_account_updates_token(isolated_db):
-    from providers.qclaw.store import upsert_account
+    from buddy2api.providers.qclaw.store import upsert_account
 
     first = upsert_account(
         parse_credentials(
@@ -216,7 +216,7 @@ def test_aizone_headers_require_conversation_request_id():
 
 
 def test_static_models_include_pool_glm():
-    from providers.qclaw import PROVIDER
+    from buddy2api.providers.qclaw import PROVIDER
 
     assert "pool-glm-5.2" in STATIC_MODELS
     assert PROVIDER.accepts_model("auto")

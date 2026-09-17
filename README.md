@@ -15,7 +15,7 @@ Buddy2api 在本机提供 `http://127.0.0.1:8787/v1`。你在官方客户端里�
 四个通道默认都开。没装、没登录的通道，账号页检测为空，不会自动入库。
 
 ```powershell
-python server.py
+python -m buddy2api
 ```
 
 | 通道 | 默认 | 本机登录位置 |
@@ -38,12 +38,12 @@ python server.py
 
    注意：这种失败目前和「通道里没有可用账号」共用同一个错误（503 `channel_unavailable`），看到它时记得先确认是不是钉住的账号挂了。
 3. **某个通道返回 503 `channel_unavailable`：** 这个通道还没导入可用账号。
-4. **QClaw / QwenWork 请在 Windows 上直接跑 `python server.py`。** Linux Docker 读不了这两家用 DPAPI 加密的本机文件；管理页会写明这一点。WorkBuddy 可以继续用 Docker。
+4. **QClaw / QwenWork 请在 Windows 上直接跑 `python -m buddy2api`。** Linux Docker 读不了这两家用 DPAPI 加密的本机文件；管理页会写明这一点。WorkBuddy 可以继续用 Docker。
 5. 本项目和聊天客户端最好在同一台电脑。客户端如果跑在 Docker 里，Base URL 填 `http://host.docker.internal:8787/v1`，不要填容器自己的 `127.0.0.1`。
 
 ## 安装与启动
 
-还没装环境时按这几步走。已经有虚拟环境的，装完 `requirements.txt` 后执行 `python server.py` 即可。
+还没装环境时按这几步走。已经有虚拟环境的，装完 `requirements.txt` 后执行 `python -m buddy2api` 即可。
 
 ### 1. 安装工具
 
@@ -65,7 +65,7 @@ conda --version
 ```powershell
 git clone https://github.com/wicm84266964/Buddy2api.git
 cd Buddy2api
-Get-ChildItem README.md, requirements.txt, server.py
+Get-ChildItem README.md, requirements.txt, buddy2api
 ```
 
 后面的命令都要在这个目录里执行。
@@ -77,7 +77,7 @@ conda create -n buddy2api python=3.12 -y
 conda activate buddy2api
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python server.py
+python -m buddy2api
 ```
 
 看到监听信息后，浏览器打开：
@@ -91,15 +91,15 @@ http://127.0.0.1:8787
 ```powershell
 cd <你的项目路径>\Buddy2api
 conda activate buddy2api
-python server.py
+python -m buddy2api
 ```
 
 提示符前面应出现 `(buddy2api)`，再执行 `python -m pip`，避免装到系统 Python。
 
 ### 其他启动方式
 
-- **脚本：** Windows 安装 Python 时勾选 Add Python to PATH，在项目目录执行 `.\start.bat`。Linux / macOS：`chmod +x start.sh && ./start.sh`。脚本优先用名为 `buddy2api` 的 Conda 环境，没有 Conda 才建 `.venv`。
-- **Docker：** `powershell -ExecutionPolicy Bypass -File .\start-docker-win.ps1`。本机没有 WorkBuddy 登录目录时脚本仍会启动。容器下拉里仍有四个通道，但 QClaw / QwenWork 请用上面的 `python server.py`。TraeWork 登录文件不是 DPAPI，本机 `python server.py` 导入后 Docker 也能用库里的 token。
+- **脚本：** Windows 安装 Python 时勾选 Add Python to PATH，在项目目录执行 `.\scripts\start.bat`。Linux / macOS：`chmod +x scripts/start.sh && ./scripts/start.sh`。脚本优先用名为 `buddy2api` 的 Conda 环境，没有 Conda 才建 `.venv`。
+- **Docker：** `powershell -ExecutionPolicy Bypass -File .\scripts\start-docker-win.ps1`。本机没有 WorkBuddy 登录目录时脚本仍会启动。容器下拉里仍有四个通道，但 QClaw / QwenWork 请用上面的 `python -m buddy2api`。TraeWork 登录文件不是 DPAPI，本机 `python -m buddy2api` 导入后 Docker 也能用库里的 token。
 
 ### 第一次打开网页之后
 
@@ -117,7 +117,7 @@ python server.py
 
 ```powershell
 $env:CB_GATEWAY_ADMIN_TOKEN="cb-admin-请换成足够长的随机值"
-python server.py
+python -m buddy2api
 ```
 
 ### 更新
@@ -129,7 +129,7 @@ cd <你的项目路径>\Buddy2api
 git pull --ff-only
 conda activate buddy2api
 python -m pip install -r requirements.txt
-python server.py
+python -m buddy2api
 ```
 
 ## 常见问题
@@ -137,7 +137,7 @@ python server.py
 - `git` 或 `conda` 不是内部命令：关掉终端重开；Conda 用户改用 Miniconda Prompt。
 - `No module named ...`：先 `conda activate buddy2api`，再 `python -m pip install -r requirements.txt`。
 - 下载依赖很慢：确认能访问 PyPI，不要混用好几个 Python。
-- 端口 8787 被占用：关掉旧的 Buddy2api，或 `python server.py --port 8788`。
+- 端口 8787 被占用：关掉旧的 Buddy2api，或 `python -m buddy2api --port 8788`。
 - 网页里一个账号都没有：还没导入。选对通道再检测；登录目录不对就设 `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR`。
 - 创建 Key 失败：没选通道。
 - 客户端 503 `channel_unavailable`：这个 Key 绑定的通道还没有可用账号；如果这把 Key 钉了具体账号，也可能是钉住的账号当前不可用（停用 / 冷却中 / 通道不符）。改绑、或把绑定清成「不绑定」回到自动选号。

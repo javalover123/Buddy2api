@@ -1,4 +1,4 @@
-import fingerprint
+import buddy2api.fingerprint as fingerprint
 
 
 def test_chat_headers_include_cli_fingerprint_not_cosy_or_refresh():

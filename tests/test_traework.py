@@ -4,19 +4,19 @@ from pathlib import Path
 
 import pytest
 
-import credential_crypto
-import database as db
-import providers
-import router
-from providers.protocol import UnknownModel
-from providers.traework.chat import (
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
+import buddy2api.providers as providers
+import buddy2api.router as router
+from buddy2api.providers.protocol import UnknownModel
+from buddy2api.providers.traework.chat import (
     _stream_once,
     extract_assistant_text,
     extract_assistant_turn,
     translate_model,
 )
-from providers.traework.crypto import decrypt_tc_b64
-from providers.traework.store import parse_credentials, traework_auth_dirs
+from buddy2api.providers.traework.crypto import decrypt_tc_b64
+from buddy2api.providers.traework.store import parse_credentials, traework_auth_dirs
 
 
 @pytest.fixture()
@@ -80,7 +80,7 @@ def test_bind_traework_when_enabled(isolated_db, traework_enabled):
 
 
 def test_parse_supplier_models_official_grouped_list():
-    from providers.traework.models import parse_supplier_models
+    from buddy2api.providers.traework.models import parse_supplier_models
 
     parsed = parse_supplier_models(
         {
@@ -194,7 +194,7 @@ def test_extract_deepseek_finish_without_reasoning():
 
 
 def test_traework_sources_do_not_touch_workbuddy_stack():
-    root = Path(__file__).resolve().parents[1] / "providers" / "traework"
+    root = Path(__file__).resolve().parents[1] / "buddy2api" / "providers" / "traework"
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert "copilot.tencent.com" not in text

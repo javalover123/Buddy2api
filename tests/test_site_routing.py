@@ -23,13 +23,13 @@ import time
 
 import pytest
 
-import auth_manager
-import catalog
-import database as db
-import fingerprint
-import proxy
-import site_preference
-import sites
+import buddy2api.auth_manager as auth_manager
+import buddy2api.catalog as catalog
+import buddy2api.database as db
+import buddy2api.fingerprint as fingerprint
+import buddy2api.proxy as proxy
+import buddy2api.site_preference as site_preference
+import buddy2api.sites as sites
 
 
 @pytest.fixture(autouse=True)

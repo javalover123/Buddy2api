@@ -10,11 +10,11 @@ COPY . .
 RUN useradd --create-home --uid 1000 buddy2api \
     && mkdir -p /app/data \
     && chown -R buddy2api:buddy2api /app \
-    && chmod +x /app/docker-entrypoint.sh \
-    && ln -s /app/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+    && chmod +x /app/scripts/docker-entrypoint.sh \
+    && ln -s /app/scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 
 EXPOSE 8787
 
-CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["python", "-m", "buddy2api", "--host", "0.0.0.0", "--port", "8787"]

@@ -863,8 +863,8 @@ const app=createApp({
         </div>
       </div>
       <div class="callout" v-if="importSummary.length" style="margin-bottom:12px"><div v-for="line in importSummary" :key="line">{{line}}</div></div>
-      <div class="callout" v-if="disc?.runtime?.host_auth_limited" style="margin-bottom:12px">当前是 Linux Docker。QClaw / 千问办公的 Windows 登录文件在容器里解不开。这两家请在本机用 <span class="mono">python server.py</span> 启动后再检测导入。WorkBuddy 可以继续用这个容器。</div>
-      <div class="callout" v-else-if="disc?.runtime?.container && !disc.runtime.auth_mount_exists" style="margin-bottom:12px">当前运行在 Docker 容器内，容器不能直接扫描 Windows 的 C 盘。Windows Docker 推荐用 <span class="mono">.\start-docker-win.ps1</span> 启动，它会自动把默认登录目录只读挂载到 <span class="mono">/auth</span>。</div>
+      <div class="callout" v-if="disc?.runtime?.host_auth_limited" style="margin-bottom:12px">当前是 Linux Docker。QClaw / 千问办公的 Windows 登录文件在容器里解不开。这两家请在本机用 <span class="mono">python -m buddy2api</span> 启动后再检测导入。WorkBuddy 可以继续用这个容器。</div>
+      <div class="callout" v-else-if="disc?.runtime?.container && !disc.runtime.auth_mount_exists" style="margin-bottom:12px">当前运行在 Docker 容器内，容器不能直接扫描 Windows 的 C 盘。Windows Docker 推荐用 <span class="mono">.\scripts\start-docker-win.ps1</span> 启动，它会自动把默认登录目录只读挂载到 <span class="mono">/auth</span>。</div>
       <div v-if="dl" class="load" style="padding:18px"><div class="spin"></div></div>
       <template v-else>
         <div class="detect-grid">

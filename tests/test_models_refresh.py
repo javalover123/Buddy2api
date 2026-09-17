@@ -5,15 +5,15 @@ from pathlib import Path
 
 import pytest
 
-import credential_crypto
-import database as db
-import providers
-import router
-import server
-from providers.protocol import KeyChannelMismatch, UnknownModel
-from providers.qclaw.constants import STATIC_MODELS as QCLAW_STATIC
-from providers.qwenwork.constants import STATIC_MODELS as QWEN_STATIC
-from providers.traework.constants import STATIC_MODELS as TRAE_STATIC
+import buddy2api.credential_crypto as credential_crypto
+import buddy2api.database as db
+import buddy2api.providers as providers
+import buddy2api.router as router
+import buddy2api.server as server
+from buddy2api.providers.protocol import KeyChannelMismatch, UnknownModel
+from buddy2api.providers.qclaw.constants import STATIC_MODELS as QCLAW_STATIC
+from buddy2api.providers.qwenwork.constants import STATIC_MODELS as QWEN_STATIC
+from buddy2api.providers.traework.constants import STATIC_MODELS as TRAE_STATIC
 
 QCLAW_NEW_ID = "qclaw-live-only-model"
 QWEN_NEW_ID = "qwen-live-only-model"
@@ -190,10 +190,10 @@ def _install_supplier_http(monkeypatch):
                 return _FakeResponse(WORKBUDDY_HTTP_PAYLOAD)
             raise AssertionError(f"unexpected GET {url}")
 
-    monkeypatch.setattr("providers.qclaw.jprx.httpx.AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr("providers.traework.models.httpx.AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr("providers.qwenwork.models.httpx.AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr("providers.workbuddy.models.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("buddy2api.providers.qclaw.jprx.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("buddy2api.providers.traework.models.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("buddy2api.providers.qwenwork.models.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("buddy2api.providers.workbuddy.models.httpx.AsyncClient", FakeAsyncClient)
     return requested
 
 
@@ -393,7 +393,7 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
 
 
 def test_parse_workbuddy_supplier_models_skips_image_and_non_string_ids():
-    from providers.workbuddy.models import parse_supplier_models
+    from buddy2api.providers.workbuddy.models import parse_supplier_models
 
     models = parse_supplier_models(WORKBUDDY_HTTP_PAYLOAD)
     ids = {item["id"] for item in models}
@@ -402,7 +402,7 @@ def test_parse_workbuddy_supplier_models_skips_image_and_non_string_ids():
 
 
 def test_manual_add_goes_to_selected_channel(isolated_db, all_channels):
-    import catalog
+    import buddy2api.catalog as catalog
 
     custom_qw = "qwork-user-added"
     custom_wb = "wb-user-added"
@@ -445,7 +445,7 @@ def test_manual_add_goes_to_selected_channel(isolated_db, all_channels):
 
 
 def test_manual_extra_survives_live_refresh(isolated_db, all_channels, monkeypatch):
-    import catalog
+    import buddy2api.catalog as catalog
 
     extra = "qclaw-hand-added"
     wb_extra = "wb-hand-added"
@@ -474,7 +474,7 @@ def test_manual_extra_survives_live_refresh(isolated_db, all_channels, monkeypat
 
 
 def test_manual_add_rejects_unknown_channel(isolated_db, all_channels):
-    import catalog
+    import buddy2api.catalog as catalog
 
     with pytest.raises(catalog.CatalogError):
         catalog.upsert_model("not-a-channel", "foo")
@@ -493,7 +493,7 @@ def test_manual_add_rejects_unknown_channel(isolated_db, all_channels):
 
 def test_official_model_can_be_removed_and_restored(isolated_db, all_channels, monkeypatch):
     """官方模型也要能删：删除落墓碑，一键读取不会带回来，重新添加同一个 ID 即恢复。"""
-    import catalog
+    import buddy2api.catalog as catalog
 
     workbuddy = providers.get_provider("workbuddy")
     assert workbuddy.accepts_model("glm-5.2")
