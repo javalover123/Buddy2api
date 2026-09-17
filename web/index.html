@@ -345,7 +345,12 @@ table{font-size:12px}.table-scroll{background:#fff}th{padding:9px 12px;backgroun
 .mini-table td,.mini-table th{padding:8px 11px}.mono,code{letter-spacing:0}
 .badge{border-radius:4px;padding:3px 7px}.badge.active,.badge.ok{background:var(--green-bg);color:var(--green)}.badge.warn{background:#fff1da;color:#9a5c14}.badge.inactive{background:#eeeeeb;color:#77756f}
 .tag{background:#efefec;color:#6e6d67;border:1px solid #e1e1dc;border-radius:4px}.tag.warn{background:#fff1da;color:#9a5c14;border-color:#f1d5a8}
-.searchbox,.selectctl,.numctl,.field input,.field textarea,.field select{background:#fff;border-color:#d3d3cd;border-radius:6px}.searchbox:focus,.selectctl:focus,.numctl:focus,.field input:focus,.field textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 12%,transparent)}
+.searchbox,.selectctl,.numctl,.field input,.field textarea,.field select{background:#fff;border-color:#d3d3cd;border-radius:6px}.searchbox:focus,.selectctl:focus,.numctl:focus,.field input:focus,.field textarea:focus,.field select:focus{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 12%,transparent)}
+/* 站点偏好表：三列内容都很窄，默认均分会把大片空白堆在中间，列头和控件看起来错位。
+   固定后两列宽度，让「模型 ID」吃掉剩余宽度，下拉框列跟表头对齐且足够宽。 */
+.site-table th:nth-child(2),.site-table td:nth-child(2){width:170px}
+.site-table th:nth-child(3),.site-table td:nth-child(3){width:300px}
+.site-table .selectctl{width:100%;max-width:260px}
 .seg{border-radius:6px;background:#fff}.seg button{background:#fff}.seg button.on{background:#3f3f3d;color:#fff}
 .codeblk{background:#242321;color:#d8d4cc;border-color:#383632;border-radius:6px}.codeblk .k{color:#ff8a48}.codeblk .s{color:#ffd19a}
 .callout{background:#f7f7f4}.quick-row .qv,.info-row .v{background:#f5f5f2}.setup-tabs button{border-radius:6px}.setup-tabs button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -1092,7 +1097,6 @@ const app=createApp({
 },template:`
 <div>
   <div class="phead"><h1>模型配置</h1><p>四通道目录均来自上游或本地回退；自定义模型用“添加模型”，官方条目不改名</p></div>
-  <div class="tbar"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="restoreHidden" :disabled="restoring">{{restoring?'恢复中':'恢复已删除'}}</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></div>
   <div class="card" v-if="sources.length" style="margin-bottom:12px"><div class="card-h">各通道供应模型<span class="sub">在线读取或回退本地/后台列表，互不合并</span></div>
     <table><thead><tr><th>通道</th><th>方式</th><th>数量</th><th>说明</th></tr></thead><tbody>
     <tr v-for="s in sources" :key="s.channel"><td>{{s.display_name||s.channel}} <span class="tag">{{s.channel}}</span></td><td><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></td><td>{{s.count||0}}</td><td class="mono" style="color:var(--fg3)">{{s.message||'—'}}</td></tr>
@@ -1106,11 +1110,12 @@ const app=createApp({
       <select class="selectctl" v-model="siteDefault" aria-label="默认站点偏好"><option v-for="g in siteGroups" :key="'d-'+g.id" :value="g.id">{{g.label}}</option></select>
       <button class="btn s pri" @click="saveSitePref">保存站点偏好</button>
     </div>
-    <div class="table-scroll"><table><thead><tr><th>模型 ID</th><th>通道</th><th>站点偏好</th></tr></thead><tbody>
+    <div class="table-scroll"><table class="site-table"><thead><tr><th>模型 ID</th><th>通道</th><th>站点偏好</th></tr></thead><tbody>
     <tr v-for="x in siteRows" :key="'site-'+x.id"><td class="mono">{{x.id}}</td><td><span class="tag">{{x.channel}}</span></td><td><select class="selectctl" :value="siteFor(x.id)" @change="setSiteFor(x.id,$event.target.value)" :aria-label="'站点偏好 '+x.id"><option v-for="g in siteGroups" :key="x.id+'-'+g.id" :value="g.id">{{g.label}}</option></select></td></tr>
     <tr v-if="!siteRows.length"><td colspan="3" class="empty">暂无模型</td></tr>
     </tbody></table></div>
   </div>
+  <div class="tbar"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="restoreHidden" :disabled="restoring">{{restoring?'恢复中':'恢复已删除'}}</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></div>
   <div class="card" v-for="s in modelSources" :key="'cat-'+s.channel" style="margin-bottom:12px">
     <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{s.models.length}} 个模型<span v-if="s.hidden_count"> · 已删除 {{s.hidden_count}}</span></span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></div>
     <div class="hint" style="padding:8px 16px">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项和不需要的官方模型都能删，删除后一键读取不会带回来。手动项标<span class="tag">手动</span>，恢复回来的官方项标<span class="tag warn">已删除</span>。</div>
