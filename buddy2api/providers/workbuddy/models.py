@@ -7,6 +7,8 @@ Skip rows whose tags include text-to-image.
 
 from __future__ import annotations
 
+import re
+
 import httpx
 
 import buddy2api.auth_manager as auth_manager
@@ -39,8 +41,27 @@ def parse_supplier_models(payload) -> list[dict]:
         description = str(row.get("description") or "")
         if description:
             item["description"] = description
+        # 官方客户端模型选择器里的「x0.79 / Free now」就来自这个字段：上游给出的是
+        # "x0.79 credits" / "x0.00" 这样的字符串，不解析的话目录页就只剩模型名了。
+        rate = _parse_credits(row.get("credits"))
+        if rate is not None:
+            item["credit_rate"] = rate
         models.append(item)
     return models
+
+
+def _parse_credits(value) -> float | None:
+    """"x0.79 credits" / "x0.00" → 0.79；解析不了返回 None。
+
+    用正则而不是 strip("x")：容忉空格、大小写与未来可能出现的其它后缀。
+    """
+    match = re.search(r"x\s*([0-9]+(?:\.[0-9]+)?)", str(value or ""), re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return round(float(match.group(1)), 4)
+    except ValueError:
+        return None
 
 
 def _model_rows(payload) -> list:

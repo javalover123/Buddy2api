@@ -350,6 +350,13 @@ table{font-size:12px}.table-scroll{background:#fff}th{padding:9px 12px;backgroun
    固定后两列宽度，让「模型 ID」吃掉剩余宽度，下拉框列跟表头对齐且足够宽。 */
 .site-table th:nth-child(2),.site-table td:nth-child(2){width:170px}
 .site-table th:nth-child(3),.site-table td:nth-child(3){width:300px}
+/* 列栅格对齐：站点偏好表与模型目录表是两张独立表格，各自按内容分列宽会错位。
+   给两张表的右恧列固定同样的宽度（通道/名称列对齐、偏好/来源+操作对齐），
+   让「模型 ID」列在两张表里吃掉同样的剩余宽度。 */
+.cat-table th:nth-child(2),.cat-table td:nth-child(2){width:170px}
+.cat-table th:nth-child(3),.cat-table td:nth-child(3){width:130px}
+.cat-table th:nth-child(4),.cat-table td:nth-child(4){width:130px}
+.cat-table th:nth-child(5),.cat-table td:nth-child(5){width:170px}
 /* 站点偏好自定义下拉：button 模拟 select，浮层 fixed 定位避免被表格容器裁剪。 */
 .site-btn{width:100%;max-width:260px;display:flex;justify-content:space-between;align-items:center;gap:8px;text-align:left;cursor:pointer}
 .site-btn .chev{flex-shrink:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid #8a8982}
@@ -363,6 +370,11 @@ table{font-size:12px}.table-scroll{background:#fff}th{padding:9px 12px;backgroun
 .card-ops .ops-text{flex:1;min-width:260px}
 .card-ops .ops-btns{display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap}
 .seg{border-radius:6px;background:#fff}.seg button{background:#fff}.seg button.on{background:#3f3f3d;color:#fff}
+/* 站点筛选按钮上的数量徽标：默认灰字，选中时反白，避免在白底上糊成一片。 */
+.seg-count{margin-left:5px;font-size:10px;color:var(--fg3)}.seg button.on .seg-count{color:rgba(255,255,255,.75)}
+/* 卡片头右侧的控件组（站点筛选 + 状态徽标）：整体作为一个 flex 子项，保持标题在左、
+   徽标在右的原布局，而不是让它们各自成为一个被 space-between 摊开的独立项。 */
+.card-h .cat-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
 .codeblk{background:#242321;color:#d8d4cc;border-color:#383632;border-radius:6px}.codeblk .k{color:#ff8a48}.codeblk .s{color:#ffd19a}
 .callout{background:#f7f7f4}.quick-row .qv,.info-row .v{background:#f5f5f2}.setup-tabs button{border-radius:6px}.setup-tabs button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .modal{border-radius:8px;box-shadow:0 24px 80px rgba(0,0,0,.25)}.ov{background:rgba(29,28,26,.5);backdrop-filter:blur(2px)}
@@ -379,6 +391,8 @@ table{font-size:12px}.table-scroll{background:#fff}th{padding:9px 12px;backgroun
   .top-actions{gap:5px}.refresh-cta{width:36px;height:36px;padding:0;justify-content:center}.refresh-cta span:last-child{display:none}
   .topnav{margin:0 -10px -9px;padding:6px 10px;background:#171614}.topnav .nav-item{padding:7px 9px}.topnav .nav-item span{display:none}
   .content{padding:10px}.phead{display:block;margin-bottom:9px}.phead h1{font-size:18px}.phead p{margin-top:2px}.tbar{align-items:stretch;overflow-x:auto;flex-wrap:nowrap}
+  /* 窄屏下卡片头放不下「标题 + 站点筛选 + 徽标」时整体换行，避免标题/副标题被压成竖排。 */
+  .card-h{flex-wrap:wrap;row-gap:6px}.card-h .cat-right{margin-left:auto}
   .today-usage-head{padding:10px 12px;display:grid;justify-content:stretch;gap:7px}.today-period{justify-self:start}.today-metrics{grid-template-columns:1fr 1fr}.today-metric{padding:13px 12px}.today-metric:nth-child(2){border-right:0}.today-metric:last-child{grid-column:1/-1;border-top:1px solid var(--border2)}.today-value{font-size:25px}.today-meta{white-space:normal;min-height:31px}
   .today-chart-head{align-items:flex-start;flex-direction:column}.today-chart-title{display:block}.today-chart-title .sub{display:block;max-width:none;text-align:left;margin-top:3px}.today-chart-controls{width:100%}.today-chart-controls .seg{display:flex;width:100%}.today-chart-controls button{flex:1}.hour-chart-body{padding:14px 12px 12px}.hour-chart-canvas{grid-template-columns:40px minmax(0,1fr);gap:6px}.hour-x-axis{margin-left:46px}
   .donut-split{grid-template-columns:1fr;justify-items:center}.donut{margin:0 auto}
@@ -1114,24 +1128,45 @@ const app=createApp({
   function rmAlias(k){const ch=aliasChannel.value;const o={...(al.value[ch]||{})};delete o[k];al.value={...al.value,[ch]:o}}
   function modeText(s){return s.mode==='live'?'在线读取':(s.mode==='fallback'?'回退本地':'未读取')}
   function modeClass(s){return s.mode==='live'?'ok':(s.mode==='fallback'?'warn':'')}
+  function money(v){return Number(v||0).toFixed(4).replace(/\.?0+$/,'')}
+  // 扣费基准：官方客户端模型选择器里的「x0.79 / Free now」就是同一个数据。
+  // 两边倍率不同（如 hy4-preview 国际 x0.00、国内 x0.29）时分开展示。
+  const siteShort={domestic:'国内',international:'国际'};
+  // 倍率 0 直接写「免费」：官方客户端也是这么显示的（Free now），比 x0 好认。
+  function rateText(v){return Number(v)===0?'免费':'x'+money(v)}
+  function creditText(x){
+    const rates=x.site_rates||{};
+    // 站点视图里只看这个站点的倍率；只有在「全部」视图才把两边都列出来。
+    if(siteFilter.value!=='all' && rates[siteFilter.value]!=null)return rateText(rates[siteFilter.value]);
+    if(x.credit_rate!=null)return rateText(x.credit_rate);
+    const parts=Object.keys(rates).map(k=>siteShort[k]+' '+rateText(rates[k]));
+    return parts.length?parts.join(' / '):'—';
+  }
+  function creditTitle(x){
+    const usage=x.credit_requests?x.credit_requests+' 次成功请求、累计 '+money(x.credit)+' 积分':'暂无成功请求';
+    return '扣费基准（倍率）· '+usage;
+  }
+  // 国内版与国际版的模型集几乎不重叠，但目录是并集，看不出某个模型属于哪一边。
+  // 按站点筛选：站点未知的模型（手动项、或进程重启后还没刷新过目录）不隐藏，
+  // 否则切一下就「少了一半模型」，比不筛还难理解。
+  const siteFilter=ref('all');
+  const siteFilterOptions=[{id:'all',label:'全部'},{id:'international',label:'国际版'},{id:'domestic',label:'国内版'}];
+  function hasSiteInfo(s){return s.channel==='workbuddy'}
+  function siteCount(s,group){return (s.models||[]).filter(x=>(x.sites||[]).includes(group)).length}
+  function visibleModels(s){const models=s.models||[];if(siteFilter.value==='all')return models;return models.filter(x=>{const sites=x.sites||[];return !sites.length||sites.includes(siteFilter.value)})}
   const modelSources=computed(()=>channels.value.map(c=>{const s=sources.value.find(x=>x.channel===c.id)||{};return {...s,channel:c.id,display_name:c.display_name,models:s.models||[]}}));
   // 站点偏好按「裸模型 id」保存，跨通道同名模型共用一条配置，所以这里按 id 去重。
   const siteRows=computed(()=>{const out=[],seen=new Set();modelSources.value.forEach(s=>{(s.models||[]).forEach(x=>{const id=String(x.id||'');if(!id||seen.has(id))return;seen.add(id);out.push({id,name:x.name||id,channel:s.channel})})});return out});
   const aliasRows=computed(()=>al.value[aliasChannel.value]||{});
   const aliasTargets=computed(()=>{const s=modelSources.value.find(x=>x.channel===aliasChannel.value);return s?s.models:[]});
   const aliasChannelName=computed(()=>(channels.value.find(c=>c.id===aliasChannel.value)||{}).display_name||aliasChannel.value);
-  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,restoring,restoreHidden,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,aliasChannel,aliasRows,aliasTargets,aliasChannelName,sitePref,siteDefault,siteGroups,siteRows,siteFor,siteMenu,siteMenuPos,siteLabel,openSiteMenu,closeSiteMenu,pickSite,saveSitePref,I}
+  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,restoring,restoreHidden,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,money,rateText,creditText,creditTitle,siteFilter,siteFilterOptions,hasSiteInfo,siteCount,visibleModels,aliasChannel,aliasRows,aliasTargets,aliasChannelName,sitePref,siteDefault,siteGroups,siteRows,siteFor,siteMenu,siteMenuPos,siteLabel,openSiteMenu,closeSiteMenu,pickSite,saveSitePref,I}
 },template:`
 <div>
   <div class="phead"><h1>模型配置</h1><p>四通道目录均来自上游或本地回退；自定义模型用“添加模型”，官方条目不改名</p></div>
-  <div class="card" v-if="sources.length" style="margin-bottom:12px"><div class="card-h">各通道供应模型<span class="sub">在线读取或回退本地/后台列表，互不合并</span></div>
-    <table><thead><tr><th>通道</th><th>方式</th><th>数量</th><th>说明</th></tr></thead><tbody>
-    <tr v-for="s in sources" :key="s.channel"><td>{{s.display_name||s.channel}} <span class="tag">{{s.channel}}</span></td><td><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></td><td>{{s.count||0}}</td><td class="mono" style="color:var(--fg3)">{{s.message||'—'}}</td></tr>
-    </tbody></table>
-  </div>
   <div class="card" style="margin-bottom:12px">
     <div class="card-h">站点偏好<span class="sub">同一个模型两边计费不同时，优先用哪边的账号</span></div>
-    <div class="hint" style="padding:8px 16px">国内版与国际版分开计费，而且「免费」是「模型 × 站点」的属性：实测 deepseek-v4.1-flash 国际版 1750 次全部免费、国内版 497 次里 485 次扣费，而 glm-5.3 反过来国际版收费。默认的「自动」会从历史请求日志里统计每个模型两边的实际扣费，优先用免费或单次更便宜的那边；两边一样或样本不足 5 次时先不区分。只影响优先级：偏好那边没有可用账号（或都已试过）时会自动退回另一边，不会让请求无账号可用。</div>
+    <div class="hint" style="padding:8px 16px">国内版与国际版分开计费，「免费」是「模型 × 站点」的属性，同一个模型两边的实际扣费可能完全不同。默认的「自动」会从历史请求日志里统计每个模型两边的实际扣费，优先用免费或单次更便宜的那边；两边一样或样本不足 5 次时先不区分。只影响优先级：偏好那边没有可用账号（或都已试过）时会自动退回另一边，不会让请求无账号可用。</div>
     <div style="padding:8px 16px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <label style="font-size:12px;color:var(--fg2)">未单独配置的模型</label>
       <select class="selectctl" v-model="siteDefault" aria-label="默认站点偏好"><option v-for="g in siteGroups" :key="'d-'+g.id" :value="g.id">{{g.label}}</option></select>
@@ -1143,16 +1178,17 @@ const app=createApp({
     </tbody></table></div>
   </div>
   <div class="card" v-for="s in modelSources" :key="'cat-'+s.channel" style="margin-bottom:12px">
-    <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{s.models.length}} 个模型<span v-if="s.hidden_count"> · 已删除 {{s.hidden_count}}</span></span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></div>
-    <div class="hint card-ops"><span class="ops-text">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项和不需要的官方模型都能删，删除后一键读取不会带回来。手动项标<span class="tag">手动</span>，恢复回来的官方项标<span class="tag warn">已删除</span>。</span><span class="ops-btns"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="restoreHidden" :disabled="restoring">{{restoring?'恢复中':'恢复已删除'}}</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></span></div>
-    <table><thead><tr><th>模型 ID</th><th>名称</th><th>来源</th><th>操作</th></tr></thead><tbody>
-    <tr v-for="(x,i) in s.models" :key="s.channel+'-'+i">
+    <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{visibleModels(s).length}} 个模型<span v-if="s.hidden_count"> · 已删除 {{s.hidden_count}}</span></span><span class="cat-right"><span class="seg" v-if="hasSiteInfo(s)" role="group" aria-label="按站点筛选模型"><button v-for="o in siteFilterOptions" :key="o.id" :class="{on:siteFilter===o.id}" @click="siteFilter=o.id">{{o.label}}<span v-if="o.id!=='all'" class="seg-count">{{siteCount(s,o.id)}}</span></button></span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></span></div>
+    <div class="hint card-ops"><span class="ops-text"><span v-if="s.message" class="mono" style="color:var(--fg3)">上游返回：{{s.message}} · </span>客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项和不需要的官方模型都能删，删除后一键读取不会带回来。手动项标<span class="tag">手动</span>，恢复回来的官方项标<span class="tag warn">已删除</span>。</span><span class="ops-btns"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="restoreHidden" :disabled="restoring">{{restoring?'恢复中':'恢复已删除'}}</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></span></div>
+    <table class="cat-table"><thead><tr><th>模型 ID</th><th>名称</th><th>扣费基准</th><th>来源</th><th>操作</th></tr></thead><tbody>
+    <tr v-for="(x,i) in visibleModels(s)" :key="s.channel+'-'+i">
       <td class="mono">{{s.channel}}/{{x.id}}</td>
       <td>{{x.name||x.id}}</td>
+      <td class="mono" :title="creditTitle(x)">{{creditText(x)}}</td>
       <td><span v-if="x.hidden" class="tag warn">已删除</span><span v-else-if="x.manual" class="tag">手动</span><span v-else class="muted">官方</span></td>
       <td><button class="btn s danger" @click="rmExtra(s.channel,x.id)">{{x.hidden?'取消删除':'删除'}}</button></td>
     </tr>
-    <tr v-if="!s.models.length"><td colspan="4" class="empty">暂无模型</td></tr>
+    <tr v-if="!visibleModels(s).length"><td colspan="5" class="empty">{{s.models.length?'该站点下没有模型':'暂无模型'}}</td></tr>
     </tbody></table>
   </div>
   <div class="site-menu" v-if="siteMenu" :style="{top:siteMenuPos.top+'px',left:siteMenuPos.left+'px'}" @click.stop role="menu">

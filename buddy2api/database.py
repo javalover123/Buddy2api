@@ -909,6 +909,78 @@ def observed_site_costs(window_days: int = 30) -> dict[str, dict[str, dict]]:
     return profile
 
 
+def model_site_usage(window_days: int = 90) -> dict[str, set[str]]:
+    """从成功请求日志里反证「这个模型在哪个站点能服务」。
+
+    上游的目录接口（/v2/enterprises/personal/models）只是官方客户端的推荐清单，
+    并不等于实际可服务范围：实测国际站目录里没有 deepseek-v4.1-flash，但国际站
+    账号打它 24 小时内成功 2641 次且全部免费。所以站点归属除了目录还要看实测。
+
+    返回 {裸模型 id: {站点分组}}；带通道前缀的日志（workbuddy/xxx）会归一化到裸 id。
+    """
+    since = int(time.time()) - max(1, int(window_days)) * 86400
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT l.model AS model, a.domain AS domain
+            FROM logs l JOIN accounts a ON a.id = l.account_id
+            WHERE l.created_at >= ? AND l.account_id IS NOT NULL
+              AND l.status_code BETWEEN 200 AND 299
+              AND l.model IS NOT NULL AND l.model != ''
+            GROUP BY l.model, a.domain
+            """,
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+    usage: dict[str, set[str]] = {}
+    for row in rows:
+        model = str(row["model"] or "").strip().split("/", 1)[-1]
+        domain = row["domain"]
+        if not model or not domain:
+            continue
+        import buddy2api.sites as sites
+
+        usage.setdefault(model, set()).add(sites.site_group(domain))
+    return usage
+
+
+def model_credit_totals() -> dict[str, dict]:
+    """按模型统计累计积分消耗（全部日志里的成功请求）。
+
+    模型目录页要用它显示「这个模型一共花了多少积分」，所以必须每次现算：日志一直在写，
+    缓存住就等于把「刷新」按钮变成摆设。查询只做一次 GROUP BY，实测与
+    observed_site_costs 同量级，可以直接放在目录接口里。
+
+    返回 {模型: {"credit": 累计扣费, "requests": 成功次数}}。
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT model AS model,
+                   COALESCE(SUM(credit), 0) AS credit,
+                   COUNT(*) AS requests
+            FROM logs
+            WHERE status_code BETWEEN 200 AND 299 AND model IS NOT NULL AND model != ''
+            GROUP BY model
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    totals: dict[str, dict] = {}
+    for row in rows:
+        model = str(row["model"] or "").strip()
+        if not model:
+            continue
+        totals[model] = {
+            "credit": round(float(row["credit"] or 0), 4),
+            "requests": int(row["requests"] or 0),
+        }
+    return totals
+
+
 def reset_account_request_counts() -> int:
     """把全部账号的终身请求计数归零，返回受影响行数。
 

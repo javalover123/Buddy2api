@@ -51,10 +51,10 @@ WORKBUDDY_HTTP_PAYLOAD = {
     "msg": "ok",
     "data": {
         "models": [
-            {"id": "auto", "name": "Auto", "tags": ["craft"]},
-            {"id": "glm-5.2", "name": "GLM-5.2", "tags": ["craft"]},
-            {"id": WB_NEW_ID, "name": "WB Live Only", "tags": []},
-            {"id": "hunyuan-image-v3.0", "name": "Hunyuan Image V3", "tags": ["text-to-image"]},
+            {"id": "auto", "name": "Auto", "tags": ["craft"], "credits": "x0.79 credits"},
+            {"id": "glm-5.2", "name": "GLM-5.2", "tags": ["craft"], "credits": "x3.31 credits"},
+            {"id": WB_NEW_ID, "name": "WB Live Only", "tags": [], "credits": "x0.00"},
+            {"id": "hunyuan-image-v3.0", "name": "Hunyuan Image V3", "tags": ["text-to-image"], "credits": "x1.0"},
             {"id": 123, "name": "numeric-id-skipped"},
         ]
     },
@@ -535,3 +535,215 @@ def test_official_model_can_be_removed_and_restored(isolated_db, all_channels, m
     catalog.remove_model("workbuddy", "glm-5.2")
     assert catalog.removed_ids("workbuddy") == {"glm-5.2"}
     assert "glm-5.2" not in _ids(workbuddy.list_models())
+
+
+def test_catalog_snapshot_annotates_credit_and_sites(isolated_db, all_channels):
+    """目录接口要能直接喂给模型配置页：每个模型带累计积分与可用站点。
+
+    「刷新」按钮就是重新拉一次这个接口，所以积分必须在请求时现算 —— 这里往日志里写
+    两条请求，断言快照里的 credit 跟着变，而不是读某个缓存。
+    """
+    import buddy2api.auth_manager as auth_manager
+    import buddy2api.catalog as catalog
+    import buddy2api.sites as sites
+
+    intl = db.add_account(
+        {
+            "name": "intl",
+            "uid": "intl-1",
+            "provider": "workbuddy",
+            "status": "active",
+            "access_token": "tok-intl",
+            "domain": "www.workbuddy.ai",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    cn = db.add_account(
+        {
+            "name": "cn",
+            "uid": "cn-1",
+            "provider": "workbuddy",
+            "status": "active",
+            "access_token": "tok-cn",
+            "domain": "www.workbuddy.cn",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    auth_manager.record_account_models(intl, ["glm-5.2", "kimi-k2.7"])
+    auth_manager.record_account_models(cn, ["auto", "kimi-k2.7"])
+    # 持久化的站点/扣费基准（真实场景由刷新目录时写入）。
+    db.set_setting(catalog.MODEL_SITES_SETTING, {
+        "workbuddy": {
+            "auto": {"sites": ["domestic"], "rate": {"domestic": 2.2}},
+            "glm-5.2": {"sites": ["international"], "rate": {"international": 0.79}},
+            "kimi-k2.7": {"sites": ["domestic", "international"],
+                          "rate": {"domestic": 1.2, "international": 0.9}},
+        }
+    })
+    try:
+        db.add_log({"model": "auto", "account_id": cn, "credit": 1.5, "status_code": 200})
+        db.add_log({"model": "workbuddy/auto", "account_id": cn, "credit": 0.5, "status_code": 200})
+        db.add_log({"model": "auto", "account_id": cn, "credit": 9.9, "status_code": 500})
+        db.add_log({"model": "glm-5.2", "account_id": intl, "credit": 0, "status_code": 200})
+
+        snap = {item["channel"]: item for item in catalog.catalog_snapshot()["sources"]}
+        wb = {item["id"]: item for item in snap["workbuddy"]["models"]}
+
+        # 带通道前缀与不带前缀的日志都算进同一个模型；失败请求不计。
+        assert wb["auto"]["credit"] == 2.0
+        assert wb["auto"]["credit_requests"] == 2
+        assert wb["auto"]["sites"] == [sites.SITE_DOMESTIC]
+        assert wb["glm-5.2"]["sites"] == [sites.SITE_INTERNATIONAL]
+        assert wb["kimi-k2.7"]["sites"] == sorted([sites.SITE_DOMESTIC, sites.SITE_INTERNATIONAL])
+        # 扣费基准：按站点记录的官方倍率（站点未知时不能瞎猜一个）。
+        assert wb["auto"]["credit_rate"] == 2.2
+        assert wb["glm-5.2"]["credit_rate"] == 0.79
+        # 两边倍率不同的模型不给单一值，由前端按站点分别展示。
+        assert "credit_rate" not in wb["kimi-k2.7"]
+        assert wb["kimi-k2.7"]["site_rates"] == {"domestic": 1.2, "international": 0.9}
+        # 没有持久化信息的模型不瞎补字段。
+        assert "credit_rate" not in wb["glm-5v-turbo"]
+        # 没有成功请求的模型显示 0 而不是缺字段（前端据此渲染「—」）。
+        assert wb["kimi-k2.7"]["credit"] == 0
+        assert wb["kimi-k2.7"]["credit_requests"] == 0
+
+        # 非 WorkBuddy 通道不贴站点标签：它们的账号没有国内/国际站之分。
+        for channel, source in snap.items():
+            if channel == "workbuddy":
+                continue
+            assert all(not item["sites"] for item in source["models"])
+            assert all("credit" in item for item in source["models"])
+    finally:
+        auth_manager.forget_account(intl)
+        auth_manager.forget_account(cn)
+
+
+def test_refresh_returns_credit_annotations_too(isolated_db, all_channels, monkeypatch):
+    """一键读取供应模型同样要带积分与站点 —— 它是页面上另一个会刷新列表的按钮。"""
+    import buddy2api.auth_manager as auth_manager
+    import buddy2api.catalog as catalog
+    import buddy2api.sites as sites
+
+    _seed_live_accounts()
+    _install_supplier_http(monkeypatch)
+    monkeypatch.setattr(server, "ALLOW_NO_ADMIN_AUTH", True)
+    account = db.list_accounts(provider="workbuddy")[0]
+    db.update_account(account["id"], {"domain": "www.workbuddy.cn"})
+    try:
+        db.add_log({"model": WB_NEW_ID, "account_id": account["id"], "credit": 3.25, "status_code": 200})
+        sources = _by_channel(asyncio.run(server.admin_refresh_models()))
+        rows = {item["id"]: item for item in sources["workbuddy"]["models"]}
+        assert rows[WB_NEW_ID]["credit"] == 3.25
+        assert rows[WB_NEW_ID]["credit_requests"] == 1
+        assert rows[WB_NEW_ID]["sites"] == [sites.SITE_DOMESTIC]
+        # 刷新会把上游的 credits 字段写入持久化映射，下次快照（重启后）仍有倍率。
+        stored = db.get_setting(catalog.MODEL_SITES_SETTING, {})["workbuddy"]
+        assert stored[WB_NEW_ID]["sites"] == [sites.SITE_DOMESTIC]
+        assert catalog.catalog_snapshot()["sources"]
+    finally:
+        auth_manager.forget_account(account["id"])
+
+
+def test_parse_supplier_models_keeps_credit_rate():
+    """上游的 credits 字段是官方客户端「x0.79 / Free now」的来源，不能在解析时丢掉。
+
+    同一个模型两边的倍率不同（实测 hy4-preview 国际 x0.00、国内 x0.29），
+    所以这里必须原样保留数值，由目录层按站点分组记录。
+    """
+    from buddy2api.providers.workbuddy.models import _parse_credits, parse_supplier_models
+
+    assert _parse_credits("x0.79 credits") == 0.79
+    assert _parse_credits("x0.00") == 0.0
+    assert _parse_credits("X3.31") == 3.31
+    assert _parse_credits(None) is None
+    assert _parse_credits("") is None
+    assert _parse_credits("not-a-number") is None
+
+    models = parse_supplier_models(WORKBUDDY_HTTP_PAYLOAD)
+    by_id = {item["id"]: item for item in models}
+    assert by_id["auto"]["credit_rate"] == 0.79
+    assert by_id[WB_NEW_ID]["credit_rate"] == 0.0
+    # 非 WorkBuddy 的通道与 text-to-image 行不涉及；缺失字段不给默认值。
+    assert "credit_rate" not in by_id.get("hunyuan-image-v3.0", {"id": 123})
+
+
+def test_credit_rate_falls_back_to_observed_free_usage(isolated_db, all_channels):
+    """目录里没有某站点的倍率时，用成功日志反推「免费」。
+
+    线上实测：deepseek-v4.1-flash 在国际站目录里不存在，但国际站账号打它
+    5026 次全部 credit=0。此时若沿用国内目录的 x0.03，会让人以为国际站也扣费。
+    """
+    import buddy2api.auth_manager as auth_manager
+    import buddy2api.catalog as catalog
+    import buddy2api.sites as sites
+
+    intl = db.add_account(
+        {
+            "name": "intl",
+            "uid": "intl-free",
+            "provider": "workbuddy",
+            "status": "active",
+            "access_token": "tok-intl",
+            "domain": "www.workbuddy.ai",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    cn = db.add_account(
+        {
+            "name": "cn",
+            "uid": "cn-free",
+            "provider": "workbuddy",
+            "status": "active",
+            "access_token": "tok-cn",
+            "domain": "www.workbuddy.cn",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    auth_manager.record_account_models(intl, ["deepseek-v4.1-flash"])
+    auth_manager.record_account_models(cn, ["deepseek-v4.1-flash"])
+    # 目录只在采样国内站时给了倍率（国际站目录里根本没这个模型）。
+    db.set_setting(catalog.CATALOG_SETTING, {
+        "workbuddy": [
+            {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash"},
+            {"id": "glm-5.2", "name": "GLM-5.2"},
+        ]
+    })
+    db.set_setting(catalog.MODEL_SITES_SETTING, {
+        "workbuddy": {"deepseek-v4.1-flash": {"sites": ["domestic"], "rate": {"domestic": 0.03}}}
+    })
+    try:
+        for _ in range(6):
+            db.add_log({"model": "deepseek-v4.1-flash", "account_id": intl, "credit": 0, "status_code": 200})
+        for _ in range(3):
+            db.add_log({"model": "deepseek-v4.1-flash", "account_id": cn, "credit": 0.5, "status_code": 200})
+        auth_manager.forget_cost_profile()
+
+        wb = {
+            item["id"]: item
+            for source in catalog.catalog_snapshot()["sources"]
+            if source["channel"] == "workbuddy"
+            for item in source["models"]
+        }
+        row = wb["deepseek-v4.1-flash"]
+        # 国际站：实测 6 次 0 扣费 → 免费；国内站：目录给的 0.03。
+        assert row["sites"] == [sites.SITE_DOMESTIC, sites.SITE_INTERNATIONAL]
+        assert row["site_rates"] == {"domestic": 0.03, "international": 0.0}
+        # 两边倍率不同 → 不给单一值，由前端按站点分别展示。
+        assert "credit_rate" not in row
+
+        # 样本太少（<5）时不猜免费：宁可显示未知。
+        auth_manager.forget_cost_profile()
+        db.add_log({"model": "glm-5.2", "account_id": intl, "credit": 0, "status_code": 200})
+        wb2 = {
+            item["id"]: item
+            for source in catalog.catalog_snapshot()["sources"]
+            if source["channel"] == "workbuddy"
+            for item in source["models"]
+        }
+        assert wb2["glm-5.2"]["sites"] == [sites.SITE_INTERNATIONAL]
+        assert "site_rates" not in wb2["glm-5.2"]
+        assert "credit_rate" not in wb2["glm-5.2"]
+    finally:
+        auth_manager.forget_account(intl)
+        auth_manager.forget_account(cn)
+        auth_manager.forget_cost_profile()
