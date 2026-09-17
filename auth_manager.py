@@ -1337,6 +1337,24 @@ def _route_priority(account: dict) -> int:
     return _route_int(account.get("priority"), 0)
 
 
+def is_route_excluded(account: dict) -> bool:
+    """该账号是否被排除在自动选路之外（只允许被显式绑定调用）。
+
+    优先级（priority）做不到这件事：它只分档，最低档仍然是「会被用到」的档，
+    账号照样会在别人忙/被耗尽时被选中。要真正隔离一个账号，必须显式标记。
+
+    标记放在 `extra.route_exclude`（该字段本就是自由格式的账号附属信息），
+    不改 schema。被标记的账号：
+      - 不进入 `pick_account` 的候选池（即 auto / 默认调度不会用它）；
+      - 仍可被 API Key 的 default_account 绑定调用 —— 绑定走 `_pick_pinned_account`，
+        刻意不经过这里，所以「隔离」不等于「禁用」。
+    """
+    extra = account.get("extra")
+    if not isinstance(extra, dict):
+        return False
+    return bool(extra.get("route_exclude"))
+
+
 def _route_weight(account: dict) -> int:
     return max(1, _route_int(account.get("weight"), 1))
 
@@ -1459,7 +1477,9 @@ def pick_account(
     accounts = db.get_active_accounts(provider)
     candidates = [
         a for a in accounts
-        if a["id"] not in exclude_ids and not account_is_cooling_down(a["id"])
+        if a["id"] not in exclude_ids
+        and not account_is_cooling_down(a["id"])
+        and not is_route_excluded(a)
     ]
     if not candidates:
         return None
@@ -1529,6 +1549,10 @@ async def pick_account_with_fallback(
     )
     for a in expired_accounts:
         if a["id"] in (exclude_ids or set()):
+            continue
+        # 被隔离的账号同样不参与「过期账号刷新」这条回退路径：否则它会先被刷新、
+        # 再以 active 身份回到候选池，隔离就形同虚设。
+        if is_route_excluded(a):
             continue
         if model and not account_supports_model(a["id"], model):
             continue

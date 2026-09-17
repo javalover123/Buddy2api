@@ -579,6 +579,8 @@ async def admin_list_accounts(authorization: str | None = Header(default=None)):
         s["priority"] = int(a.get("priority") or 0)
         s["credit_limit"] = float(a.get("credit_limit") or 0)
         s["provider"] = a.get("provider") or "workbuddy"
+        # 只被显式绑定调用、不参与自动选路（见 auth_manager.is_route_excluded）
+        s["route_excluded"] = auth_manager.is_route_excluded(a)
         result.append(s)
     return result
 
@@ -756,10 +758,12 @@ async def admin_update_account(
 ):
     _check_admin(authorization)
     data = await _read_json_object(request)
-    allowed = {"name", "status", "weight", "priority", "credit_limit", "credit_baseline"}
+    allowed = {"name", "status", "weight", "priority", "credit_limit", "credit_baseline", "extra"}
     update_data = {k: data[k] for k in allowed if k in data}
     if "status" in update_data and update_data["status"] not in {"active", "inactive", "expired"}:
         raise HTTPException(status_code=400, detail="Invalid account status")
+    if "extra" in update_data and not isinstance(update_data["extra"], dict):
+        raise HTTPException(status_code=400, detail="extra must be an object")
     if "credit_limit" in update_data and "credit_baseline" not in update_data:
         account = db.get_account(aid)
         if not account:

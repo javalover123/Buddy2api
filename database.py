@@ -389,12 +389,17 @@ def _migrate_account_credentials(conn: sqlite3.Connection):
 
 
 def _migrate_daily_usage(conn: sqlite3.Connection):
+    # 只聚合仍然存在的 key：logs.api_key_id 没有外键约束，删 key 的历史遗留（或异常
+    # 数据）会留下孤儿引用。这里的 INSERT 带外键目标表，孤儿一旦混入就是
+    # IntegrityError —— 而 init_db 在启动路径上，等于一个坏行能把整个服务卡死
+    # （2026-09-17 实测）。所以过滤条件必须留在 SQL 里，启动对脏数据健壮。
     conn.execute(
         """
         INSERT INTO api_key_daily_usage (api_key_id, usage_date, request_count)
         SELECT api_key_id, date(created_at, 'unixepoch', 'localtime'), COUNT(*)
         FROM logs
         WHERE api_key_id IS NOT NULL AND created_at >= ?
+          AND api_key_id IN (SELECT id FROM api_keys)
         GROUP BY api_key_id, date(created_at, 'unixepoch', 'localtime')
         ON CONFLICT(api_key_id, usage_date) DO UPDATE SET
             request_count=MAX(api_key_daily_usage.request_count, excluded.request_count)
@@ -728,6 +733,11 @@ def update_api_key(kid: int, data: dict):
 def delete_api_key(kid: int):
     with _lock:
         conn = get_conn()
+        # 先摘掉引用再删 key：logs 保留原文（只去掉归属），daily_usage 行随之失去意义、
+        # 一并删除。否则留下孤儿 api_key_id，下次重启 _migrate_daily_usage 聚合 logs 时
+        # 会撞 api_key_daily_usage 的外键，直接把整个服务卡死在启动阶段（2026-09-17 实测）。
+        conn.execute("UPDATE logs SET api_key_id=NULL WHERE api_key_id=?", (kid,))
+        conn.execute("DELETE FROM api_key_daily_usage WHERE api_key_id=?", (kid,))
         conn.execute("DELETE FROM api_keys WHERE id=?", (kid,))
         conn.commit()
         conn.close()

@@ -166,6 +166,11 @@ def _upsert_workbuddy(parsed: dict, auth_path: str) -> str:
         for row in db.list_accounts(provider="workbuddy"):
             if str(row.get("uid") or "") == uid:
                 patch = {key: parsed[key] for key in _TOKEN_FIELDS if key in parsed}
+                # extra 必须合并而不是整体覆盖：_TOKEN_FIELDS 含 extra，而这里的
+                # parsed.extra 只带本次的 auth_path。直接覆盖会把账号上已有的
+                # 附属标记（如 route_exclude）在每次启动自动导入时静默抹掉。
+                existing_extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+                patch["extra"] = {**existing_extra, **extra}
                 db.update_account(row["id"], patch)
                 return "updated"
     db.add_account(parsed)
