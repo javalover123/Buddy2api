@@ -125,6 +125,23 @@ def test_build_backend_body_fills_missing_reasoning_content_in_thinking_mode(mon
     assert "reasoning_content" not in body["messages"][-1]
 
 
+def test_build_backend_body_fills_null_reasoning_content(monkeypatch):
+    """显式 null 与缺失等价：上游只认字段值，客户端序列化出 null 同样会触发 11155。"""
+    monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
+    monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
+
+    body = proxy.build_backend_body({
+        "model": "deepseek-v4-pro",
+        "reasoning_effort": "high",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi", "reasoning_content": None},
+        ],
+    })
+
+    assert body["messages"][-1]["reasoning_content"] == ""
+
+
 def test_build_backend_body_preserves_existing_reasoning_content(monkeypatch):
     monkeypatch.delenv("CB_GATEWAY_REASONING_PASSTHROUGH", raising=False)
     monkeypatch.setattr(proxy, "resolve_model_alias", lambda model: model)
@@ -196,8 +213,31 @@ def test_dump_rejected_request_writes_body_and_prunes(monkeypatch, tmp_path):
     assert dumped["status"] == 400
     assert "11155" in dumped["error"]
     assert dumped["messages_summary"] == [
-        {"role": "assistant", "has_reasoning_content": False, "tool_calls": 0}
+        {"role": "assistant", "reasoning_content": "missing", "tool_calls": 0}
     ]
+
+
+def test_dump_rejected_request_keeps_newest_file(monkeypatch, tmp_path):
+    """清理必须按写入时间：文件名前缀是状态码，字典序会把新写的 400 排到最前删掉。"""
+    monkeypatch.setattr(proxy, "_DEBUG_REJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(proxy, "_DEBUG_REJECT_KEEP", 2)
+
+    for index in range(2):
+        old = tmp_path / f"reject-429-20260916-20{index:02d}00-{index:08x}.json"
+        old.write_text("{}", encoding="utf-8")
+        os.utime(old, (1000 + index, 1000 + index))
+
+    proxy._dump_rejected_request({"model": "m", "messages": []}, 400, b'{"code":11155}')
+
+    files = list(tmp_path.glob("reject-400-*.json"))
+    assert len(files) == 1, "刚落盘的 400 样本不能被自己的清理逻辑删掉"
+
+
+def test_describe_reasoning_content_distinguishes_states():
+    assert proxy._describe_reasoning_content({}) == "missing"
+    assert proxy._describe_reasoning_content({"reasoning_content": None}) == "null"
+    assert proxy._describe_reasoning_content({"reasoning_content": ""}) == "empty"
+    assert proxy._describe_reasoning_content({"reasoning_content": "x"}) == "present"
 
 
 def test_dump_rejected_request_ignores_success_and_server_errors(monkeypatch, tmp_path):

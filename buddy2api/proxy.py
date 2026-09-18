@@ -379,7 +379,11 @@ def _thinking_mode_enabled(reasoning_effort) -> bool:
 
 
 def _ensure_reasoning_content_on_assistant_messages(messages, thinking_enabled: bool):
-    """thinking 模式下为缺失 reasoning_content 的 assistant 消息补空串占位。"""
+    """thinking 模式下为缺失 reasoning_content 的 assistant 消息补空串占位。
+
+    显式的 null 也当成缺失：上游只看到字段值，null 与「没有这个字段」对它没有区别，
+    而客户端（opencode 一类）序列化时确实会写出 null。
+    """
     if not thinking_enabled or not _reasoning_passthrough_enabled():
         return messages
     if not isinstance(messages, list):
@@ -390,7 +394,7 @@ def _ensure_reasoning_content_on_assistant_messages(messages, thinking_enabled: 
         if (
             isinstance(message, dict)
             and message.get("role") == "assistant"
-            and "reasoning_content" not in message
+            and message.get("reasoning_content") is None
         ):
             message = {**message, "reasoning_content": ""}
             changed = True
@@ -453,6 +457,18 @@ _DEBUG_REJECT_DIR = os.environ.get("CB_GATEWAY_DEBUG_REJECT_DIR", "").strip()
 _DEBUG_REJECT_KEEP = 20
 
 
+def _describe_reasoning_content(message: dict):
+    """区分「没这个字段」/「null」/「空串」/「有值」——排查 11155 时这四者意义完全不同。"""
+    if "reasoning_content" not in message:
+        return "missing"
+    value = message.get("reasoning_content")
+    if value is None:
+        return "null"
+    if value == "":
+        return "empty"
+    return "present"
+
+
 def _dump_rejected_request(
     body: dict,
     status: int,
@@ -482,7 +498,7 @@ def _dump_rejected_request(
             [
                 {
                     "role": message.get("role"),
-                    "has_reasoning_content": "reasoning_content" in message,
+                    "reasoning_content": _describe_reasoning_content(message),
                     "tool_calls": len(message.get("tool_calls") or []),
                 }
                 for message in messages
@@ -510,7 +526,7 @@ def _dump_rejected_request(
             ),
             encoding="utf-8",
         )
-        stale = sorted(directory.glob("reject-*.json"))
+        stale = sorted(directory.glob("reject-*.json"), key=lambda p: p.stat().st_mtime)
         for old in stale[:-_DEBUG_REJECT_KEEP]:
             try:
                 old.unlink()
