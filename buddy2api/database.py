@@ -851,6 +851,14 @@ def api_key_increment_usage(kid: int, tokens: int):
 # 15 分钟：足够覆盖一次突发，又短到让空闲账号迅速回到同一水位。
 ROUTE_WINDOW_SECONDS = int(os.environ.get("CB_GATEWAY_ROUTE_WINDOW_SECONDS", "900"))
 
+# 质量口径：一次客户端请求可能被上游拒绝后换账号重试，每次失败尝试都会落一行 log
+# （status_code=429/401/502、finish_reason='retry'，见 proxy.py 的重试循环）。这些行是
+# **中间过程**而非最终结果 —— 后续尝试往往已经成功返回给客户端。若把它们计入
+# errors，成功率和错误数会严重偏离用户实际体验（实测 391 行 retry 中 387 行随后成功）。
+# 因此质量统计一律排除 retry 行；retry 行本身仍保留在 logs 表里，可供排障时查看。
+_SQL_IS_ERROR = "status_code < 200 OR status_code >= 300 OR finish_reason='error'"
+_SQL_NOT_RETRY = "finish_reason IS NOT 'retry'"
+
 
 def recent_account_loads(window_seconds: Optional[int] = None) -> dict[int, int]:
     """各账号在最近 window_seconds 内成功服务的请求数。
@@ -1191,7 +1199,11 @@ def search_logs(filters: Optional[dict] = None) -> dict:
 
 def get_stats() -> dict:
     conn = get_conn()
-    total_requests = conn.execute("SELECT COUNT(*) as c FROM logs").fetchone()["c"]
+    # total_requests 是成功率的分母，必须与 success/errors 同口径（排除 retry 中间尝试），
+    # 否则 9 次重试后成功 1 次会被算成 10% 成功率，而不是用户视角的 100%。
+    total_requests = conn.execute(
+        f"SELECT COUNT(*) as c FROM logs WHERE {_SQL_NOT_RETRY}"
+    ).fetchone()["c"]
     total_tokens = conn.execute("SELECT COALESCE(SUM(total_tokens),0) as s FROM logs").fetchone()["s"]
     total_credit = conn.execute("SELECT COALESCE(SUM(credit),0) as s FROM logs").fetchone()["s"]
     success_requests = conn.execute("""
@@ -1199,7 +1211,9 @@ def get_stats() -> dict:
         WHERE status_code BETWEEN 200 AND 299
           AND finish_reason NOT IN ('error', 'content_filter')
     """).fetchone()["c"]
-    error_requests = conn.execute("SELECT COUNT(*) as c FROM logs WHERE status_code < 200 OR status_code >= 300 OR finish_reason='error'").fetchone()["c"]
+    error_requests = conn.execute(
+        f"SELECT COUNT(*) as c FROM logs WHERE ({_SQL_IS_ERROR}) AND {_SQL_NOT_RETRY}"
+    ).fetchone()["c"]
     filtered_requests = conn.execute("SELECT COUNT(*) as c FROM logs WHERE finish_reason='content_filter'").fetchone()["c"]
     avg_duration_ms = conn.execute("SELECT COALESCE(AVG(duration_ms),0) as v FROM logs WHERE duration_ms IS NOT NULL").fetchone()["v"]
     active_accounts = conn.execute("SELECT COUNT(*) as c FROM accounts WHERE status='active'").fetchone()["c"]
@@ -1208,14 +1222,14 @@ def get_stats() -> dict:
     total_keys = conn.execute("SELECT COUNT(*) as c FROM api_keys").fetchone()["c"]
 
     today_start = _today_start_ts()
-    today = conn.execute("""
+    today = conn.execute(f"""
         SELECT COUNT(*) as requests,
                COALESCE(SUM(total_tokens),0) as tokens,
                COALESCE(SUM(credit),0) as credit,
                COALESCE(AVG(duration_ms),0) as avg_duration_ms,
                COALESCE(SUM(prompt_tokens),0) as prompt_tokens,
                COALESCE(SUM(cached_tokens),0) as cached_tokens
-        FROM logs WHERE created_at >= ?
+        FROM logs WHERE created_at >= ? AND {_SQL_NOT_RETRY}
     """, (today_start,)).fetchone()
     today_success = conn.execute("""
         SELECT COUNT(*) as c FROM logs
@@ -1223,9 +1237,9 @@ def get_stats() -> dict:
           AND status_code BETWEEN 200 AND 299
           AND finish_reason NOT IN ('error', 'content_filter')
     """, (today_start,)).fetchone()["c"]
-    today_errors = conn.execute("""
+    today_errors = conn.execute(f"""
         SELECT COUNT(*) as c FROM logs
-        WHERE created_at >= ? AND (status_code < 200 OR status_code >= 300 OR finish_reason='error')
+        WHERE created_at >= ? AND ({_SQL_IS_ERROR}) AND {_SQL_NOT_RETRY}
     """, (today_start,)).fetchone()["c"]
     today_filtered = conn.execute(
         "SELECT COUNT(*) as c FROM logs WHERE created_at >= ? AND finish_reason='content_filter'",
