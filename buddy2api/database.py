@@ -157,6 +157,7 @@ def init_db():
             completion_tokens INTEGER DEFAULT 0,
             total_tokens    INTEGER DEFAULT 0,
             credit          REAL DEFAULT 0,
+            cached_tokens   INTEGER DEFAULT 0,
             finish_reason   TEXT,
             duration_ms     INTEGER,
             status_code     INTEGER,
@@ -368,6 +369,8 @@ def _migrate_logs_provider(conn: sqlite3.Connection):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(logs)").fetchall()}
     if "provider" not in cols:
         conn.execute("ALTER TABLE logs ADD COLUMN provider TEXT")
+    if "cached_tokens" not in cols:
+        conn.execute("ALTER TABLE logs ADD COLUMN cached_tokens INTEGER DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_provider ON logs(provider)")
 
 
@@ -1018,15 +1021,16 @@ def add_log(data: dict):
         conn.execute("""
             INSERT INTO logs
                 (api_key_id, api_key_name, account_id, account_name, model, stream,
-                 prompt_tokens, completion_tokens, total_tokens, credit,
+                 prompt_tokens, completion_tokens, total_tokens, credit, cached_tokens,
                  finish_reason, duration_ms, status_code, error_msg, provider, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             data.get("api_key_id"), data.get("api_key_name"),
             data.get("account_id"), data.get("account_name"),
             data.get("model", ""), data.get("stream", 0),
             data.get("prompt_tokens", 0), data.get("completion_tokens", 0),
             data.get("total_tokens", 0), data.get("credit", 0),
+            data.get("cached_tokens", 0),
             data.get("finish_reason", ""), data.get("duration_ms", 0),
             data.get("status_code", 200), data.get("error_msg", ""),
             data.get("provider") or "workbuddy",
@@ -1046,9 +1050,9 @@ def record_request(data: dict):
                 """
                 INSERT INTO logs
                     (api_key_id, api_key_name, account_id, account_name, model, stream,
-                     prompt_tokens, completion_tokens, total_tokens, credit,
+                     prompt_tokens, completion_tokens, total_tokens, credit, cached_tokens,
                      finish_reason, duration_ms, status_code, error_msg, provider, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     data.get("api_key_id"), data.get("api_key_name"),
@@ -1056,6 +1060,7 @@ def record_request(data: dict):
                     data.get("model", ""), data.get("stream", 0),
                     data.get("prompt_tokens", 0), data.get("completion_tokens", 0),
                     data.get("total_tokens", 0), data.get("credit", 0),
+                    data.get("cached_tokens", 0),
                     data.get("finish_reason", ""), data.get("duration_ms", 0),
                     data.get("status_code", 200), data.get("error_msg", ""),
                     data.get("provider") or "workbuddy", now,
@@ -1207,7 +1212,9 @@ def get_stats() -> dict:
         SELECT COUNT(*) as requests,
                COALESCE(SUM(total_tokens),0) as tokens,
                COALESCE(SUM(credit),0) as credit,
-               COALESCE(AVG(duration_ms),0) as avg_duration_ms
+               COALESCE(AVG(duration_ms),0) as avg_duration_ms,
+               COALESCE(SUM(prompt_tokens),0) as prompt_tokens,
+               COALESCE(SUM(cached_tokens),0) as cached_tokens
         FROM logs WHERE created_at >= ?
     """, (today_start,)).fetchone()
     today_success = conn.execute("""
@@ -1229,7 +1236,9 @@ def get_stats() -> dict:
         SELECT CAST(strftime('%H', created_at, 'unixepoch', 'localtime') AS INTEGER) as hour,
                COUNT(*) as requests,
                COALESCE(SUM(total_tokens), 0) as tokens,
-               COALESCE(SUM(credit), 0) as credit
+               COALESCE(SUM(credit), 0) as credit,
+               COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+               COALESCE(SUM(cached_tokens), 0) as cached_tokens
         FROM logs WHERE created_at >= ?
         GROUP BY hour ORDER BY hour
     """, (today_start,)).fetchall()
@@ -1237,12 +1246,17 @@ def get_stats() -> dict:
     hourly = []
     for hour in range(24):
         row = hourly_by_hour.get(hour, {})
+        hourly_prompt = int(row.get("prompt_tokens") or 0)
+        hourly_cached = int(row.get("cached_tokens") or 0)
         hourly.append({
             "hour": hour,
             "label": f"{hour:02d}:00",
             "requests": int(row.get("requests") or 0),
             "tokens": int(row.get("tokens") or 0),
             "credit": round(float(row.get("credit") or 0), 4),
+            "prompt_tokens": hourly_prompt,
+            "cached_tokens": hourly_cached,
+            "cache_rate": round(hourly_cached / hourly_prompt * 100, 2) if hourly_prompt else 0.0,
         })
 
     # 最近 7 个自然日每日统计，补齐 0 值日期，避免图表只显示一根柱子。
@@ -1316,6 +1330,11 @@ def get_stats() -> dict:
             "filtered": int(today_filtered or 0),
             "success_rate": round((today_success / today["requests"] * 100) if today["requests"] else 0, 2),
             "avg_duration_ms": int(today["avg_duration_ms"] or 0),
+            "cached_tokens": int(today["cached_tokens"] or 0),
+            "cache_rate": round(
+                (int(today["cached_tokens"] or 0) / int(today["prompt_tokens"] or 0) * 100)
+                if int(today["prompt_tokens"] or 0) else 0.0, 2
+            ),
             "hourly": hourly,
         },
         "active_accounts": active_accounts,

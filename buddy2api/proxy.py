@@ -932,10 +932,24 @@ class _SSEEventDecoder:
         self._event_bytes = 0
 
 
+def _usage_cached_tokens(usage: dict) -> int:
+    """从上游 usage 提取缓存命中 token，兼容各家字段名。"""
+    if not isinstance(usage, dict):
+        return 0
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    candidates = (
+        usage.get("prompt_cache_hit_tokens"),
+        details.get("cached_tokens") if isinstance(details, dict) else None,
+        usage.get("cache_read_input_tokens"),
+    )
+    values = [int(v) for v in candidates if isinstance(v, (int, float)) and v > 0]
+    return max(values, default=0)
+
+
 def _log_request(api_key_info, account, model_name, stream,
                   prompt_t, completion_t, total_t, credit,
                   finish_reason, status_code, error_msg, t0,
-                  increment_usage: bool = True):
+                  increment_usage: bool = True, cached_t: int = 0):
     elapsed_ms = int((time.time() - t0) * 1000)
     log_data = {
         "api_key_id": api_key_info["id"] if api_key_info else None,
@@ -951,6 +965,7 @@ def _log_request(api_key_info, account, model_name, stream,
         "completion_tokens": completion_t,
         "total_tokens": total_t,
         "credit": credit,
+        "cached_tokens": cached_t,
         "finish_reason": finish_reason,
         "duration_ms": elapsed_ms,
         "status_code": status_code,
@@ -1399,6 +1414,7 @@ async def _stream_upstream(
                 observer.usage.get("total_tokens", 0),
                 observer.usage.get("credit", 0),
                 "error", 502, eof_error, t0,
+                cached_t=_usage_cached_tokens(observer.usage),
             )
             if observer.upstream_error_event is not None:
                 yield _json_sse_event(observer.upstream_error_event)
@@ -1436,6 +1452,7 @@ async def _stream_upstream(
             observer.usage.get("total_tokens", 0),
             observer.usage.get("credit", 0),
             log_finish, 200, log_error, t0,
+            cached_t=_usage_cached_tokens(observer.usage),
             # 要重打的一轮不计用量，最终结果由重打那一轮记账（避免一次请求算两次）。
             increment_usage=not can_retry_stall,
         )
@@ -1615,5 +1632,6 @@ async def _collect_stream(
         u.get("total_tokens", 0),
         u.get("credit", 0),
         finish_reason or "stop", 200, "", t0,
+        cached_t=_usage_cached_tokens(u),
     )
     return ("json", result)

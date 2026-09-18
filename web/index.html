@@ -309,6 +309,7 @@ body{background:#e9e9e6;letter-spacing:0;overflow-x:hidden}
 .today-hour-chart{--chart:#d85410;--chart-soft:#fff0df}.today-hour-chart.tokens{--chart:#14755f;--chart-soft:#e8f5f0}.today-hour-chart.credit{--chart:#45566a;--chart-soft:#edf1f5}
 .today-chart-head{gap:16px}.today-chart-title{display:flex;align-items:baseline;gap:10px;min-width:0}.today-chart-controls{flex:0 0 auto}.today-hour-chart .seg button.on{background:var(--chart);color:#fff}
 .hour-chart-body{padding:16px 18px 13px}.hour-chart-meta{display:flex;align-items:center;gap:8px;margin-bottom:11px;font-size:10px;color:var(--fg3)}.hour-chart-meta strong{font-size:12px;color:var(--chart)}
+.rate-legend{display:inline-flex;align-items:center;gap:4px;color:#45566a;font-weight:600}.rate-legend .rate-swatch{display:inline-block;width:14px;border-top:2px dashed #45566a}
 .hour-chart-canvas{display:grid;grid-template-columns:48px minmax(0,1fr);gap:8px}.hour-y-axis{height:168px;display:flex;flex-direction:column;justify-content:space-between;text-align:right;font-family:var(--mono);font-size:9px;color:var(--fg3);padding-bottom:2px}
 .hour-plot{height:168px;position:relative;min-width:0}.hour-grid{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;pointer-events:none}.hour-grid span{border-top:1px dashed #deded8}
 .hour-chart-empty{position:absolute;z-index:2;inset:0;display:grid;place-items:center;color:var(--fg3);font-size:11px;pointer-events:none}.hour-chart-empty span{background:#fff;border:1px solid var(--border2);border-radius:5px;padding:6px 9px}
@@ -316,8 +317,15 @@ body{background:#e9e9e6;letter-spacing:0;overflow-x:hidden}
 .hour-line{position:absolute;inset:0;width:100%;height:100%;z-index:1;overflow:visible}
 .hour-area{fill:var(--chart);opacity:.14}
 .hour-poly{fill:none;stroke:var(--chart);stroke-width:2.5;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}
+.hour-rate-poly{fill:none;stroke:#45566a;stroke-width:1.5;stroke-dasharray:4 3;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke;opacity:.85}
+.hour-rate-dot{position:absolute;width:5px;height:5px;border-radius:50%;background:#45566a;transform:translate(-50%,-50%);pointer-events:none}
 .hour-hover{position:absolute;inset:0;z-index:2;display:grid;grid-template-columns:repeat(24,minmax(0,1fr))}
 .hour-hover span{display:block;height:100%;cursor:crosshair}.hour-hover span.future{pointer-events:none}
+.hour-hover span.on{background:rgba(28,27,24,.05)}
+.hour-tip{position:absolute;z-index:5;min-width:180px;background:#1d1e1c;color:#fff;border-radius:9px;padding:10px 12px;font-size:11px;pointer-events:none;box-shadow:0 8px 22px rgba(28,27,24,.28)}
+.hour-tip .tip-title{font-weight:700;font-size:12px;margin-bottom:6px;font-family:var(--mono)}
+.hour-tip .tip-row{display:flex;align-items:center;gap:6px;margin-top:3px;color:#e8e8e2}
+.hour-tip .tip-row i{width:9px;height:9px;border-radius:2px;flex:0 0 auto}
 .donut-split{display:grid;grid-template-columns:148px minmax(0,1fr);gap:16px;align-items:center}
 .donut{width:132px;height:132px;border-radius:50%;position:relative;flex:0 0 auto;box-shadow:inset 0 0 0 1px rgba(28,27,24,.04)}
 .donut-hole{position:absolute;inset:24px;border-radius:50%;background:#fff;display:grid;place-items:center;text-align:center;box-shadow:0 0 0 1px var(--border2)}
@@ -535,7 +543,7 @@ const app=createApp({
     return[
       {kind:'credit',label:'今日额度消耗',value:money(t.credit),unit:'Credit',meta:n(requests)+' 次调用 · 单次 '+money(requests?Number(t.credit||0)/requests:0),foot:credit.value?.channels?.length?credit.value.channels.map(c=>c.id+' '+channelQuotaText(c)).join(' · '):'累计 '+money(s.value?.total_credit),footLabel:credit.value?.channels?.length?'按通道额度':'累计消耗',icon:I.wallet,...creditPoints},
       {kind:'requests',label:'今日调用次数',value:n(requests),unit:'次',meta:'成功 '+n(t.success)+' · 异常 '+n(Number(t.errors||0)+Number(t.filtered||0)),foot:pct(t.success_rate),footLabel:'成功率',icon:I.activity,...requestPoints},
-      {kind:'tokens',label:'今日 Token',value:tok(t.tokens),unit:'Tokens',meta:'单次平均 '+tok(requests?Math.round(Number(t.tokens||0)/requests):0),foot:'累计 '+tok(s.value?.total_tokens),footLabel:'全部时间',icon:I.tokens,...tokenPoints},
+      {kind:'tokens',label:'今日 Token',value:tok(t.tokens),unit:'Tokens',meta:'单次平均 '+tok(requests?Math.round(Number(t.tokens||0)/requests):0)+(Number(t.cache_rate||0)>0?' · 命中 '+pct(t.cache_rate):''),foot:'累计 '+tok(s.value?.total_tokens),footLabel:'全部时间',icon:I.tokens,...tokenPoints},
     ].map(card=>({...card,spark:sparkLine(card)}))
   });
   const todayChart=computed(()=>{
@@ -557,7 +565,11 @@ const app=createApp({
     const points=pts.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ');
     const last=pts[pts.length-1],first=pts[0];
     const area=pts.length?(first.x.toFixed(1)+','+H+' '+points+' '+last.x.toFixed(1)+','+H):'';
-    return{pts,points,area}
+    // 缓存命中率叠加线：仅 Token 指标下展示，独立 0–100% 纵轴；所有有调用的活跃小时都画点（含 0%），实时反映当小时命中率
+    const showRate=c.kind==='tokens';
+    const ratePts=showRate?pts.filter(p=>p.row&&p.row.requests>0&&p.row.cache_rate!=null).map(p=>({x:p.x,y:(H-pad)-(Number(p.row.cache_rate)/100)*(H-pad*2),rate:p.row.cache_rate,label:p.row.label})):[];
+    const rateLine=ratePts.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ');
+    return{pts,points,area,ratePts,rateLine,showRate}
   });
   const qualityPie=computed(()=>{
     const t=s.value?.today||{},success=Number(t.success||0),errors=Number(t.errors||0),filtered=Number(t.filtered||0),total=success+errors+filtered;
@@ -573,10 +585,24 @@ const app=createApp({
     const withPct=slices.map(x=>({...x,pct:total?x.value/total*100:0}));
     return{total,slices:withPct,style:pieStyle(withPct,total)}
   });
+  const hoveredHour=ref(null);
+  function hourTip(row){
+    if(!row)return null;
+    const kind=todayChartMetric.value,rows=[];
+    if(kind==='requests')rows.push({c:'#d85410',label:'调用',v:n(Number(row.requests||0))+' 次'});
+    else if(kind==='credit')rows.push({c:'#45566a',label:'额度',v:money(row.credit||0)+' credit'});
+    else{
+      rows.push({c:'#14755f',label:'实时 Tokens',v:tok(row.tokens||0)});
+      rows.push({c:'#0f766e',label:'缓存命中',v:tok(row.cached_tokens||0)});
+      rows.push({c:'#a78bfa',label:'命中率',v:pct(row.cache_rate||0)});
+      rows.push({c:'#777872',label:'请求',v:n(Number(row.requests||0))+' 次'});
+    }
+    return{title:row.label,rows}
+  }
   function heatStyle(v,max){const r=Math.max(0,Math.min(1,Number(v||0)/Math.max(Number(max||1),1)));if(!v)return{background:'#e8e9e6',color:'#777872'};if(r<.25)return{background:'#fff0ce',color:'#8a5d22'};if(r<.5)return{background:'#ffc98f',color:'#734217'};if(r<.75)return{background:'#ff9855',color:'#592b0e'};if(r<.9)return{background:'#f15f14',color:'#fff'};return{background:'#3f403e',color:'#fff'}}
   function heatValue(kind,v){return kind==='tokens'?tok(v):(kind==='credit'?money(v):n(v))}
   onMounted(load);
-  return{s,credit,ld,cld,copied,err,updatedAt,todayLabel,todayUsage,todayChartMetric,todayChart,hourLine,qualityPie,modelPie,load,refreshCredit,n,tok,pct,money,ms,fmt,healthClass,healthText,rateWidth,copy,age,expireMeta,heatRows,heatStyle,heatValue,channelUnitLabel,channelQuotaText,I}
+  return{s,credit,ld,cld,copied,err,updatedAt,todayLabel,todayUsage,todayChartMetric,todayChart,hourLine,hoveredHour,hourTip,qualityPie,modelPie,load,refreshCredit,n,tok,pct,money,ms,fmt,healthClass,healthText,rateWidth,copy,age,expireMeta,heatRows,heatStyle,heatValue,channelUnitLabel,channelQuotaText,I}
 },template:`
 <div>
   <div class="phead"><h1>运行总览</h1><p>网关状态、额度和调用强度</p></div>
@@ -628,8 +654,8 @@ const app=createApp({
     <section class="card today-hour-chart" :class="todayChart.kind" aria-labelledby="today-chart-title">
       <div class="card-h today-chart-head"><div class="today-chart-title"><span id="today-chart-title">今日 24 小时趋势</span><span class="sub">按本机时间逐小时聚合</span></div><div class="today-chart-controls"><div class="seg"><button :class="{on:todayChartMetric==='requests'}" @click="todayChartMetric='requests'">调用</button><button :class="{on:todayChartMetric==='tokens'}" @click="todayChartMetric='tokens'">Token</button><button :class="{on:todayChartMetric==='credit'}" @click="todayChartMetric='credit'">额度</button></div></div></div>
       <div class="hour-chart-body">
-        <div class="hour-chart-meta"><span>当前指标</span><strong>{{todayChart.label}}</strong><span>峰值 {{todayChart.maxLabel}} {{todayChart.unit}}</span><span>活跃 {{todayChart.activeHours}} 小时</span></div>
-        <div class="hour-chart-canvas"><div class="hour-y-axis"><span>{{todayChart.maxLabel}}</span><span>{{heatValue(todayChart.kind,todayChart.max/2)}}</span><span>0</span></div><div class="hour-plot"><div class="hour-grid"><span></span><span></span><span></span></div><svg class="hour-line" viewBox="0 0 1000 168" preserveAspectRatio="none" v-if="todayChart.max"><polygon class="hour-area" :points="hourLine.area"/><polyline class="hour-poly" :points="hourLine.points"/></svg><div class="hour-hover"><span v-for="row in todayChart.rows" :key="'ht-'+row.hour" :class="{future:row.hour>todayChart.currentHour}" :title="row.label+' · '+heatValue(todayChart.kind,row.value)+' '+todayChart.unit"></span></div><div class="hour-chart-empty" v-if="!todayChart.max"><span>今天暂无{{todayChart.label}}数据</span></div></div></div>
+        <div class="hour-chart-meta"><span>当前指标</span><strong>{{todayChart.label}}</strong><span>峰值 {{todayChart.maxLabel}} {{todayChart.unit}}</span><span>活跃 {{todayChart.activeHours}} 小时</span><span v-if="todayChart.kind==='tokens'" class="rate-legend"><i class="rate-swatch"></i>缓存命中率 今日 {{s?.today?.cache_rate||0}}%</span></div>
+        <div class="hour-chart-canvas"><div class="hour-y-axis"><span>{{todayChart.maxLabel}}</span><span>{{heatValue(todayChart.kind,todayChart.max/2)}}</span><span>0</span></div><div class="hour-plot"><div class="hour-grid"><span></span><span></span><span></span></div><svg class="hour-line" viewBox="0 0 1000 168" preserveAspectRatio="none" v-if="todayChart.max"><polygon class="hour-area" :points="hourLine.area"/><polyline class="hour-poly" :points="hourLine.points"/><polyline class="hour-rate-poly" v-if="hourLine.showRate&&hourLine.ratePts.length>1" :points="hourLine.rateLine"/></svg><span v-if="todayChart.max&&hourLine.showRate" v-for="rp in hourLine.ratePts" :key="'rate-'+rp.label" class="hour-rate-dot" :style="{left:rp.x/10+'%',top:rp.y/1.68+'%'}"></span><div class="hour-hover"><span v-for="row in todayChart.rows" :key="'ht-'+row.hour" :class="{future:row.hour>todayChart.currentHour,on:hoveredHour===row.hour}" @mouseenter="hoveredHour=row.hour" @mouseleave="hoveredHour=null"></span></div><div v-if="hoveredHour!==null&&hourTip(todayChart.rows[hoveredHour])" class="hour-tip" :style="{left:((hoveredHour+.5)/24*100)+'%',top:'6px',transform:'translateX(-50%)'}"><div class="tip-title">{{todayLabel}} {{hourTip(todayChart.rows[hoveredHour]).title}}</div><div class="tip-row" v-for="(tr,ti) in hourTip(todayChart.rows[hoveredHour]).rows" :key="ti"><i :style="{background:tr.c}"></i>{{tr.label}}：{{tr.v}}</div></div><div class="hour-chart-empty" v-if="!todayChart.max"><span>今天暂无{{todayChart.label}}数据</span></div></div></div>
         <div class="hour-x-axis"><span>00:00</span><span>04:00</span><span>08:00</span><span>12:00</span><span>16:00</span><span>20:00</span><span>23:00</span></div>
       </div>
     </section>
