@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 
+from buddy2api.model_capacity import capacity_fields
 from buddy2api.providers.qclaw.constants import (
     CMD_CREATE_API_KEY,
     CMD_MODEL_LIST,
@@ -151,7 +152,9 @@ def parse_model_list(data: dict) -> list[dict]:
         if not mid or mid in seen:
             continue
         seen.add(mid)
-        models.append({"id": mid, "name": name, "description": description})
+        item = {"id": mid, "name": name, "description": description}
+        item.update(capacity_fields(row))
+        models.append(item)
     return models
 
 

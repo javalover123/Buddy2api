@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 
+from buddy2api.model_capacity import capacity_fields
 from buddy2api.providers.traework.constants import AGENT_API, MODELS_PATH
 from buddy2api.providers.traework.token import TraeWorkAuthError, auth_headers
 
@@ -30,7 +31,9 @@ def parse_supplier_models(payload) -> list[dict]:
         if not mid or mid in seen:
             continue
         seen.add(mid)
-        models.append({"id": mid, "name": name or mid})
+        item = {"id": mid, "name": name or mid}
+        item.update(capacity_fields(row))
+        models.append(item)
     return models
 
 

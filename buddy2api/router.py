@@ -10,6 +10,7 @@ from fastapi import HTTPException
 
 import buddy2api.providers as providers
 import buddy2api.responses as responses
+from buddy2api.model_capacity import clamp_output_tokens
 from buddy2api.reasoning_controls import normalize_chat_reasoning
 from buddy2api.providers.protocol import (
     BindResult,
@@ -237,6 +238,9 @@ async def _chat_after_bind_no_echo(
         raise UnknownChannel(bound.channel)
     inner = provider.translate_model(bound.inner)
     dispatch = normalize_chat_reasoning(dispatch_payload(payload, inner))
+    model = next((item for item in provider.list_models()
+                  if isinstance(item, dict) and item.get("id") == inner), None)
+    dispatch = clamp_output_tokens(dispatch, model)
     info = dict(api_key_info or {})
     info["_log_model"] = bound.original
     info["_bind_channel"] = bound.channel

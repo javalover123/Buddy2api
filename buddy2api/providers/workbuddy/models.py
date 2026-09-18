@@ -12,6 +12,7 @@ import re
 import httpx
 
 import buddy2api.auth_manager as auth_manager
+from buddy2api.model_capacity import capacity_fields
 
 MODELS_PATH = "/v2/enterprises/personal/models"
 _NON_CHAT_TAGS = frozenset({"text-to-image"})
@@ -38,6 +39,7 @@ def parse_supplier_models(payload) -> list[dict]:
         seen.add(mid)
         name = str(row.get("name") or row.get("display_name") or mid)
         item = {"id": mid, "name": name or mid}
+        item.update(capacity_fields(row))
         description = str(row.get("description") or "")
         if description:
             item["description"] = description

@@ -7,6 +7,7 @@ import uuid
 
 import httpx
 
+from buddy2api.model_capacity import capacity_fields
 from buddy2api.providers.qwenwork import cosy
 from buddy2api.providers.qwenwork.chat import static_headers
 from buddy2api.providers.qwenwork.constants import GATEWAY, MODELS_PATH, SCENE
@@ -28,6 +29,7 @@ def parse_supplier_models(payload) -> list[dict]:
             continue
         seen.add(mid)
         item = {"id": mid, "name": name or mid}
+        item.update(capacity_fields(row))
         description = str(row.get("description") or "")
         if description:
             item["description"] = description

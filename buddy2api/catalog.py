@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 import buddy2api.database as db
 import buddy2api.sites as sites
 from buddy2api import auth_manager
+from buddy2api.model_capacity import capacity_fields
 
 CATALOG_SETTING = "channel_catalogs"
 REFRESH_SETTING = "channel_catalog_refresh"
@@ -78,6 +79,7 @@ def normalize_models(rows: Any) -> list[dict]:
             continue
         seen.add(mid)
         item = {"id": mid, "name": name or mid}
+        item.update(capacity_fields(row))
         if description:
             item["description"] = description
         # 官方扣费基准（"x0.79 credits" → 0.79）：目录页要显示，不能在这里丢掉。
