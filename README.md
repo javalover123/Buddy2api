@@ -194,6 +194,12 @@ python -m buddy2api
 
 各通道缺失的容量字段分别默认显示 262,144 上下文 / 32,768 输出，`capacity_source` 标记每个字段来自 `catalog` 还是 `fallback`。默认值是配置兜底，不是上游保证；同名模型在不同通道的限制也可能不同。仅当目录中有已知输出限制时，网关会把显式的 `max_tokens` / `max_completion_tokens` 裁剪到该限制（Responses 的 `max_output_tokens` 经转换后同样适用）。未指定输出预算的请求不注入预算，未知容量不用于强制裁剪。达到输出上限仍可能以 `length` 结束，容量发现不能保证长任务永不截断。
 
+目录里带思考档位的通道（目前只有 WorkBuddy）会把上游的 `supportsReasoning`、`reasoning.supportedEfforts`、默认档和 `canDisableThinking` 一并写进 `/v1/models`，裸 id 与 `workbuddy/` 前缀都带。上游没给档位列表就不编——QClaw、QwenWork、TraeWork 只按各自协议处理思考，不在模型列表里发明档位。部署后需要再点一次 WorkBuddy 的「一键读取供应模型」，旧目录里没有这些字段。
+
+### 失败分类
+
+请求日志的 `finish_reason` 对上游失败分为四类：`upstream_http`（上游返回了 HTTP 错误）、`upstream_disconnect`（连接被断开）、`incomplete_stream`（流提前结束，缺少 `[DONE]` 或 `finish_reason`）、`parse_error`（SSE 事件解析不了）。`error_msg` 带 `[类别]` 前缀；空正文写成 `upstream HTTP 502, empty body`，httpx 异常没有文案时保留异常类型名。`/v1/responses` 的 `error.code` 同样用这些类别。换号重试仍记 `retry`，正文里带类别前缀。日志筛选里的「错误」按 `status_code` 判定，中间重试行照常能查到。
+
 ### 思考强度
 
 智能体可以在 Chat Completions 中发送顶层 `reasoning_effort`，在 Responses 中发送标准的 `reasoning: {"effort": "high"}`。网关也兼容 OpenCode、DSH、Cherry 和 Claude 风格的 `reasoning.effort`、`reasoningEffort`、`thinking.type`、`thinking.effort`、`output_config.effort`、`enable_thinking` 等写法。可用档位为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`；`off` 等同于 `none`。

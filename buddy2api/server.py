@@ -383,6 +383,7 @@ async def health():
 def collect_v1_models() -> list[dict]:
     """Aggregate per-channel catalogs for GET /v1/models. WorkBuddy is bare + namespaced."""
     from buddy2api.model_capacity import discovery_capacity
+    from buddy2api.model_reasoning import discovery_reasoning
     data = []
     workbuddy = providers.get_provider("workbuddy")
     wb_models = workbuddy.list_models() if workbuddy else db.get_setting("models", proxy.DEFAULT_MODELS)
@@ -395,6 +396,7 @@ def collect_v1_models() -> list[dict]:
             "owned_by": "buddy2api",
             "channel": "workbuddy",
             **discovery_capacity(item),
+            **discovery_reasoning(item),
         })
         data.append({
             "id": f"workbuddy/{mid}",
@@ -403,6 +405,7 @@ def collect_v1_models() -> list[dict]:
             "owned_by": "buddy2api",
             "channel": "workbuddy",
             **discovery_capacity(item),
+            **discovery_reasoning(item),
         })
     for channel in providers.enabled_provider_ids():
         if channel == "workbuddy":
@@ -419,6 +422,7 @@ def collect_v1_models() -> list[dict]:
                 "owned_by": "buddy2api",
                 "channel": channel,
                 **discovery_capacity(item),
+                **discovery_reasoning(item),
             })
     return data
 
@@ -1377,11 +1381,18 @@ async def admin_update_site_preference(
 # Web UI
 # ============================================================
 
-@app.get("/")
-async def index(request: Request):
+def _render_index_html() -> str:
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     html = html.replace("/* LOCAL_MODE */ false", "true" if LOCAL_MODE else "false")
-    response = HTMLResponse(html, headers={"Cache-Control": "no-store", "Content-Security-Policy": "frame-ancestors 'none'"})
+    return html.replace("__APP_VERSION__", VERSION)
+
+
+@app.get("/")
+async def index(request: Request):
+    response = HTMLResponse(
+        _render_index_html(),
+        headers={"Cache-Control": "no-store", "Content-Security-Policy": "frame-ancestors 'none'"},
+    )
     return response
 
 

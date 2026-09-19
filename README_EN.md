@@ -120,6 +120,12 @@ Refreshing supplier models now retains upstream input/output capacities. `/v1/mo
 
 Missing fields independently fall back to 262,144 context tokens and 32,768 output tokens on every channel. The per-field `capacity_source` is `catalog` or `fallback`. Fallbacks are configuration defaults, not verified upstream limits. Explicit `max_tokens` and `max_completion_tokens` requests are clamped only when the catalog contains a known output limit; converted Responses `max_output_tokens` requests use the same path. Omitted budgets stay omitted, and unknown capacities do not impose a hard cap. Reaching a configured output budget can still produce `length`; discovery does not prevent all long-task truncation.
 
+Channels whose catalog carries reasoning metadata (currently WorkBuddy only) publish the upstream `supportsReasoning`, `reasoning.supportedEfforts`, default tier, and `canDisableThinking` on `/v1/models`, for both the bare id and the `workbuddy/` prefix. Missing effort lists are never invented: QClaw, QwenWork, and TraeWork handle reasoning through their own protocols and expose no tiers in the model list. Refresh WorkBuddy supplier models once after upgrading; older catalogs lack these fields.
+
+### Failure classes
+
+Upstream failures are classified in the request log's `finish_reason`: `upstream_http` (the upstream returned an HTTP error), `upstream_disconnect` (the connection dropped), `incomplete_stream` (the stream ended early without `[DONE]` or a `finish_reason`), and `parse_error` (an SSE event could not be parsed). `error_msg` carries a `[class]` prefix; an empty body becomes `upstream HTTP 502, empty body`, and an httpx error without text keeps its exception type name. `/v1/responses` uses the same classes for `error.code`. Failover attempts still log `retry`, with the class prefix in the message. The log filter's "error" view stays keyed on `status_code`, so intermediate retry rows remain visible for troubleshooting.
+
 ### Reasoning effort
 
 Agent clients can send top-level `reasoning_effort` to Chat Completions and the standard `reasoning: {"effort": "high"}` object to Responses. Compatibility forms used by OpenCode, DSH, Cherry, and Claude-style clients are also accepted: `reasoning.effort`, `reasoningEffort`, `thinking.type`, `thinking.effort`, `output_config.effort`, and `enable_thinking`. Accepted levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; `off` is an alias for `none`.
