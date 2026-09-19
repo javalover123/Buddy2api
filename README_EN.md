@@ -23,7 +23,7 @@ python -m buddy2api
 | WorkBuddy / CodeBuddy | on | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth` |
 | QClaw | on | `%APPDATA%\QClaw` |
 | QwenWork | on | `%APPDATA%\QwenWorkCN` |
-| TraeWork | on | `%APPDATA%\TRAE SOLO CN\User\globalStorage` |
+| TraeWork | on | Windows: `%APPDATA%\TRAE SOLO CN\User\globalStorage`; macOS: `~/Library/Application Support/TRAE SOLO CN/User/globalStorage` |
 
 Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
 
@@ -148,7 +148,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## Environment
 
-`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_GATEWAY_ROUTE_WINDOW_SECONDS` (default `900`, the load-averaging window used for account selection), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
+`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_GATEWAY_ROUTE_WINDOW_SECONDS` (default `900`, the load-averaging window used for account selection), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_TRAEWORK_OS_INFO` (the `OSInfo` reported on TraeWork refresh; Windows `windows`, macOS `mac`, Linux `linux`), `CB_TRAEWORK_DEVICE_NAME`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
 
 `CB_GATEWAY_DEFAULT_REASONING_EFFORT` controls the default reasoning effort for WorkBuddy DeepSeek V4 Pro/Flash. It accepts `low`, `high`, or `max`, defaults to `high`, and can be disabled with `off`. A Responses `reasoning.effort` or Chat Completions `reasoning_effort` value overrides the default.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,12 +20,27 @@ from buddy2api.providers.traework.constants import (
 from buddy2api.providers.traework.crypto import decrypt_tc_b64
 
 
+APP_SUPPORT_NAME = "TRAE SOLO CN"
+
+
 def traework_user_data_dir() -> Path:
+    """TraeWork 的官方用户数据目录。
+
+    Windows 是 `%APPDATA%\\TRAE SOLO CN`，macOS 是
+    `~/Library/Application Support/TRAE SOLO CN`。默认只认 Windows 路径的话，
+    Mac 上重新检测永远扫不到登录文件。
+    """
     override = os.environ.get("CB_TRAEWORK_USER_DATA_DIR", "").strip()
     if override:
         return Path(override).expanduser()
-    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    return Path(appdata) / "TRAE SOLO CN"
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / APP_SUPPORT_NAME
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA") or str(home / "AppData" / "Roaming")
+        return Path(appdata) / APP_SUPPORT_NAME
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    return xdg / APP_SUPPORT_NAME
 
 
 def traework_auth_dirs() -> list[Path]:

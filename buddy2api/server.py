@@ -1433,6 +1433,35 @@ def _open_when_ready(server, url):
         webbrowser.open(url)
 
 
+def _debugger_replaced_asyncio_run() -> bool:
+    """当前进程里的 `asyncio.run` 是否已被调试器（pydevd/nest_asyncio）换掉。
+
+    PyCharm <= 2025.1 的 pydevd 会把 `asyncio.run` 换成自己那份 `_patch_asyncio.run`，
+    而它不接受 `loop_factory` 关键字（uvicorn 0.52 的 `Server.run` 会传，见
+    https://github.com/Kludex/uvicorn/issues/2737），于是调试时启动直接 TypeError。
+    正常运行时 `asyncio.run` 就是标准库的，返回 False。
+    """
+    return getattr(asyncio.run, "__module__", "") != "asyncio.runners"
+
+
+def _serve_without_uvicorn_runner(server, listener) -> None:
+    """绕开 `Server.run` 的 `asyncio.Runner`，直接用事件循环驱动 `Server.serve`。
+
+    只在调试器换掉了 `asyncio.run` 时走这条路；`get_loop_factory()` 仍会被调用，
+    所以 uvloop 之类的自定义 loop 工厂照常生效。
+    """
+    loop_factory = server.config.get_loop_factory()
+    loop = loop_factory() if loop_factory else asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(server.serve(sockets=[listener]))
+    finally:
+        try:
+            asyncio.set_event_loop(None)
+        finally:
+            loop.close()
+
+
 def main():
     global ADMIN_TOKEN, ALLOW_NO_ADMIN_AUTH, LOCAL_MODE
 
@@ -1524,7 +1553,10 @@ def main():
     if local_host and not args.no_browser:
         threading.Thread(target=_open_when_ready, args=(server, url), daemon=True).start()
     try:
-        server.run(sockets=[listener])
+        if _debugger_replaced_asyncio_run():
+            _serve_without_uvicorn_runner(server, listener)
+        else:
+            server.run(sockets=[listener])
     except KeyboardInterrupt:
         # uvicorn 在优雅关闭结束后会按设计重新抛出 SIGINT（以便进程以信号方式退出），
         # Python 默认处理器把它变成 KeyboardInterrupt。uvicorn CLI 里有 `except KeyboardInterrupt: pass`

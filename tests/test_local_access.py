@@ -145,3 +145,69 @@ def test_remote_listener_requires_explicit_token(tmp_path):
     assert result.returncode != 0
     assert "Remote access requires" in result.stderr
     assert not (tmp_path / "never-created.db").exists()
+
+
+def test_stock_asyncio_run_uses_uvicorn_runner():
+    """标准库 asyncio.run 下走 uvicorn 自己的 Runner，不做特殊处理。"""
+    assert server._debugger_replaced_asyncio_run() is False
+
+
+def test_debugger_patched_asyncio_run_is_detected():
+    """pydevd 换掉的 asyncio.run 必须被认出来。
+
+    PyCharm <= 2025.1 的调试器用 nest_asyncio 把 asyncio.run 换成自己那份，
+    它不接受 uvicorn 0.52 传入的 loop_factory，启动会直接 TypeError。
+    """
+
+    class Patched:
+        def __call__(self, *args, **kwargs):  # pragma: no cover - 只测检测逻辑
+            raise AssertionError("should not be called")
+
+    patched = Patched()
+    patched.__module__ = "pydevd_nest_asyncio"
+    original = server.asyncio.run
+    server.asyncio.run = patched
+    try:
+        assert server._debugger_replaced_asyncio_run() is True
+    finally:
+        server.asyncio.run = original
+
+
+def test_debugger_fallback_drives_the_loop_directly(monkeypatch):
+    """回退路径必须自己建/关循环，并把 sockets 原样交给 Server.serve。"""
+    events = []
+
+    class FakeLoop:
+        def run_until_complete(self, coro):
+            events.append("run_until_complete")
+            try:
+                coro.send(None)
+            except StopIteration:
+                pass
+
+        def close(self):
+            events.append("close")
+
+    class FakeConfig:
+        def get_loop_factory(self):
+            events.append("loop_factory")
+            return FakeLoop
+
+    class FakeServer:
+        config = FakeConfig()
+
+        async def serve(self, sockets=None):
+            events.append(("serve", sockets))
+
+    monkeypatch.setattr(server.asyncio, "set_event_loop", lambda loop: events.append("set_event_loop"))
+    listener = object()
+    server._serve_without_uvicorn_runner(FakeServer(), listener)
+
+    assert events == [
+        "loop_factory",
+        "set_event_loop",
+        "run_until_complete",
+        ("serve", [listener]),
+        "set_event_loop",
+        "close",
+    ]

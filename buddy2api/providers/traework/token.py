@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -58,6 +59,27 @@ def _host(account: dict) -> str:
     return host or UG_API
 
 
+def _os_info() -> str:
+    """刷新时上报的 OSInfo。写死 windows 会让 Mac 上的刷新被上游当成异常设备。"""
+    override = os.environ.get("CB_TRAEWORK_OS_INFO", "").strip()
+    if override:
+        return override
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return "windows"
+
+
+def _device_name() -> str:
+    override = os.environ.get("CB_TRAEWORK_DEVICE_NAME", "").strip()
+    if override:
+        return override
+    if sys.platform == "win32":
+        return os.environ.get("COMPUTERNAME") or os.environ.get("USERNAME") or "PC"
+    return os.environ.get("USER") or "Mac"
+
+
 def _device_info(account: dict) -> dict:
     extra = extra_of(account)
     return {
@@ -65,10 +87,10 @@ def _device_info(account: dict) -> dict:
         "MachineID": str(extra.get("machine_id") or ""),
         "PlatformCode": PLATFORM_CODE,
         "DeviceType": "PC",
-        "DeviceName": os.environ.get("COMPUTERNAME") or os.environ.get("USERNAME") or "PC",
+        "DeviceName": _device_name(),
         "ClientVersion": IDE_VERSION,
         "DevicePublicKey": str(extra.get("public_key_pem") or ""),
-        "OSInfo": "windows",
+        "OSInfo": _os_info(),
     }
 
 
