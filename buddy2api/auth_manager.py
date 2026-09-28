@@ -26,6 +26,8 @@ import httpx
 import buddy2api.database as db
 import buddy2api.fingerprint as fingerprint
 import buddy2api.sites as sites
+import buddy2api.wb_at_rest as wb_at_rest
+from buddy2api.upstream_transport import transport_for
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
@@ -452,7 +454,9 @@ async def probe_account_credentials(account: dict) -> tuple[str, str]:
     headers = build_billing_headers(_fingerprint_account(account))
     url = f"{backend_url_for(account)}/v2/billing/meter/get-user-resource"
     try:
-        async with httpx.AsyncClient(timeout=request_timeout(15)) as c:
+        async with httpx.AsyncClient(
+            timeout=request_timeout(15), transport=transport_for(account)
+        ) as c:
             r = await c.post(url, headers=headers, json={})
     except httpx.HTTPError as exc:
         return "unknown", f"network error: {str(exc)[:120]}"
@@ -650,14 +654,11 @@ def is_encrypted_field_wrapper(value) -> bool:
     """判断字段值是否为桌面端的 `$wbEncrypted` 加密信封。
 
     新版客户端把 accessToken/refreshToken 等写成
-    {"$wbEncrypted": 1, "envelope": "<base64 JSON>"}，密钥只存在客户端侧，
-    网关解不开 —— 见到即按「不可导入」处理（见 seamless_login 模块）。
+    {"$wbEncrypted": 1, "envelope": "<base64 JSON>"}。自 2026-09-28 起网关能
+    解密这类信封（见 wb_at_rest），所以「是信封」本身不再等于「不可导入」——
+    这里只负责识别结构，能不能导入由 `_safe_auth_file_meta` 实际试解后决定。
     """
-    if not isinstance(value, dict):
-        return False
-    if value.get("$wbEncrypted") != 1:
-        return False
-    return isinstance(value.get("envelope"), str)
+    return wb_at_rest.is_encrypted_field(value)
 
 
 def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
@@ -717,8 +718,15 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
         "already_imported": bool(uid and uid in existing_uids),
     })
     if is_encrypted_field_wrapper(auth.get("accessToken")):
-        meta["encrypted"] = True
-        meta["reason"] = "凭据是新版客户端加密信封，网关无法导入（可用无感登录获取明文凭据）"
+        if _plain_auth_token(auth.get("accessToken")):
+            # 能解开：照常可导入，面板不得再报「不可导入」（encrypted 只表示解不开）。
+            meta["reason"] = "凭据是加密信封，网关可解密"
+        else:
+            meta["encrypted"] = True
+            meta["reason"] = (
+                "凭据是加密信封且网关解不开（需客户端运行以取密钥，"
+                f"或设 {wb_at_rest.SECRET_KEY_VAR}）；也可用无感登录获取明文凭据"
+            )
     return meta
 
 
@@ -852,6 +860,28 @@ def discover_auth_files(auth_dir: Optional[str] = None) -> dict:
     }
 
 
+def _plain_auth_token(value) -> Optional[str]:
+    """auth 文件里的 token 字段 → 明文；取不到明文返回 None。
+
+    - 明文字符串：原样返回（空串也照实返回，由调用方判空）；
+    - `$wbEncrypted` 信封：用 wb_at_rest 解密，成功返回明文；
+    - 信封但解不开（密钥取不到、keyId 不匹配等）：返回 None。
+      调用方必须据此跳过，**不能**当成空串 —— 否则 refresh_token 会被写成
+      空值覆盖库里现有账号，把可用凭据降级掉。
+    """
+    if isinstance(value, str):
+        return value
+    if not wb_at_rest.is_encrypted_field(value):
+        return None
+    secret = wb_at_rest.read_secret_key()
+    if not secret:
+        return None
+    try:
+        return wb_at_rest.decrypt_field(value, secret)
+    except wb_at_rest.WbAtRestError:
+        return None
+
+
 def parse_auth_file(path: Path) -> Optional[dict]:
     """解析 auth 文件，返回结构化凭据。"""
     try:
@@ -862,17 +892,22 @@ def parse_auth_file(path: Path) -> Optional[dict]:
 
     account = data.get("account", {})
     auth = data.get("auth", {})
-    access = auth.get("accessToken")
-    if not isinstance(access, str) or not access:
+    access = _plain_auth_token(auth.get("accessToken"))
+    if not access:
         # 2026-09-20：桌面端新版 auth 文件把 accessToken/refreshToken 写成了
-        # {"$wbEncrypted": .., "envelope": ..} 加密信封，网关解不开。这里必须
-        # 按无凭据跳过 —— 若把信封 dict 透传，_protect_account_data 加密时
-        # 直接 AttributeError，启动自动导入崩溃循环；更糟的是库里可用的存量
-        # 令牌会被信封垃圾覆盖。
+        # {"$wbEncrypted": .., "envelope": ..} 加密信封。能解就解（见
+        # _plain_auth_token）；解不开时必须按无凭据跳过 —— 若把信封 dict 透传，
+        # _protect_account_data 加密时直接 AttributeError，启动自动导入崩溃循环；
+        # 更糟的是库里可用的存量令牌会被信封垃圾覆盖。
         return None
-    refresh = auth.get("refreshToken")
-    if refresh is not None and not isinstance(refresh, str):
-        return None
+    raw_refresh = auth.get("refreshToken")
+    if raw_refresh is None:
+        refresh = ""
+    else:
+        refresh = _plain_auth_token(raw_refresh)
+        if refresh is None:
+            # 是信封但解不开：跳过，别把空 refresh_token 写回去覆盖现有账号。
+            return None
     session_state = auth.get("sessionState", "")
     if not isinstance(session_state, str):
         session_state = ""
@@ -884,7 +919,7 @@ def parse_auth_file(path: Path) -> Optional[dict]:
         "phone": account.get("phoneNumber", ""),
         "account_type": account.get("type", "personal"),
         "access_token": access,
-        "refresh_token": refresh if isinstance(refresh, str) else "",
+        "refresh_token": refresh or "",
         "expires_at": auth.get("expiresAt", 0),
         "refresh_expires_at": auth.get("refreshExpiresAt", 0),
         "domain": auth.get("domain", DEFAULT_DOMAIN),
@@ -966,7 +1001,9 @@ async def refresh_token(account: dict) -> bool:
         url = f"{backend_url_for(account)}/v2/plugin/auth/token/refresh"
 
         try:
-            async with httpx.AsyncClient(timeout=request_timeout(15)) as c:
+            async with httpx.AsyncClient(
+                timeout=request_timeout(15), transport=transport_for(account)
+            ) as c:
                 r = await c.post(url, headers=headers, json={})
             data = r.json()
         except (httpx.HTTPError, ValueError) as e:
@@ -1291,7 +1328,9 @@ async def fetch_account_resources(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=request_timeout(25)) as c:
+        async with httpx.AsyncClient(
+            timeout=request_timeout(25), transport=transport_for(account)
+        ) as c:
             r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/get-user-resource", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
@@ -1415,7 +1454,9 @@ async def fetch_checkin_status(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=request_timeout(20)) as c:
+        async with httpx.AsyncClient(
+            timeout=request_timeout(20), transport=transport_for(account)
+        ) as c:
             r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
@@ -1476,7 +1517,9 @@ async def claim_daily_checkin(account: dict) -> dict:
         )
 
     try:
-        async with httpx.AsyncClient(timeout=request_timeout(30)) as c:
+        async with httpx.AsyncClient(
+            timeout=request_timeout(30), transport=transport_for(fresh)
+        ) as c:
             r = await c.post(f"{backend_url_for(fresh)}/v2/billing/meter/daily-checkin", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:

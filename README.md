@@ -44,6 +44,20 @@
 
 路径不对时用 `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR` 指定（四个通道的登录文件不要混在同一目录）；只要其中一家时设 `CB_GATEWAY_PROVIDERS=workbuddy` 收窄。
 
+### WorkBuddy AI 桌面端的加密凭据
+
+WorkBuddy AI 桌面端 5.6.2 起，auth 文件里的 `accessToken` / `refreshToken` 不再是明文，而是 `{"$wbEncrypted": 1, "envelope": "…"}` 加密信封（AES-256-GCM）。密钥只存在客户端侧，所以旧版网关读不出来，**国际版账号一个都导不进来**（国内版的 `workbuddy-desktop.info` 仍是明文，不受影响）。
+
+网关现在能自己解开：密钥取自运行中的客户端（原生绑定 `workbuddyStorage.loggerGet()`），所以**导入前先把 WorkBuddy AI 客户端开着**，导入时自动解密。密钥推导与 AAD 拼装见 `buddy2api/wb_at_rest.py`（推导结果会和信封自报的 `keyId` 对账，密钥不对时明确报错而不是硬解）。
+
+不想让客户端开着，也可以直接给密钥（同一个密钥，两个环境变量二选一）：
+
+```bash
+export CB_GATEWAY_WB_AT_REST_KEY='<44 字符 canonical base64>'
+```
+
+密钥取不到或解不开时，导入按「无凭据」跳过并在账号页说明原因 —— 不会写坏库里已有的令牌。另一种做法是用「无感登录」拿明文凭据（官方 OAuth 接口不受信封影响）。
+
 ## 注意事项
 
 1. **启动后账号页是空的，这是正常的** —— 2.0 起不再自动入库。选通道 → 重新检测 → 一键导入。
@@ -158,6 +172,22 @@ CB_GATEWAY_ADMIN_TOKEN=cb-admin-请换成足够长的随机值 python -m buddy2a
 - **顺序不能反过来。** 先按到期挑账号会把请求赶到收费站点上去花真积分，只为了消耗本来就快作废的积分，净亏。
 
 到期数据来自管理页「刷新官方额度」写下的本地缓存，**选路不会为此去打上游接口**。从没刷新过、或刷新失败的账号不参与这一步（不会因此被排除，仍按负载均衡参与），所以没刷新时的行为与以前完全一致。
+
+### 国际站老是 502（ConnectTimeout）
+
+现象是成串的 `502` + `[upstream_disconnect] ConnectTimeout`，而且**只有国际站账号中招**，同一时刻国内站账号一切正常。这不是账号失效，也不是上游封禁：等几分钟故障窗口过去，同一个账号、同一个模型自己就恢复了。
+
+根因在**本机到国际站 IP 的 TCP 建连被间歇黑洞**（实测连续 60 次 SYN 全部超时，curl 直连返回 `000`，而同时段 DNS 正常、国内站 p50 0.02s、github 正常）。用户手动开 WorkBuddy 客户端时走的是系统代理，所以「客户端能用、网关不能用」。
+
+因此**国际版账号现在默认一律走代理**，不再先试直连（直连那一次本身就是会失败的那一次）。代理地址按顺序取：
+
+1. `CB_GATEWAY_UPSTREAM_PROXY`（显式配置）；
+2. `CODEBUDDY_SERVICE_PROXY_URL`（WorkBuddy 桌面端自己写的服务代理）；
+3. 系统代理（macOS 读 `scutil --proxy`，Clash 这类工具写在这里）。
+
+三者都没有时行为与以前完全一致（照旧直连）。国内站账号不变，仍是**直连优先**，仅在直连建连失败时用代理把同一请求重发一次。兜底只在**建连**阶段生效：一旦上游已经回包就不再重发（流式正文可能已经下发给客户端，重发会重复执行工具调用）。兜底触发时 `stderr` 会打一行日志（每分钟最多一行，避免故障窗口刷屏）。
+
+设 `CB_GATEWAY_INTL_PROXY=off` 可关掉国际站强制走代理，退回原来的直连优先。
 
 ## 从 1.4.x 升级
 
@@ -300,6 +330,9 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 | `CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS` | 一次请求最多换几个账号重试，默认 `8`。必须大于账号数，否则健康账号可能轮不到 |
 | `CB_GATEWAY_REASONING_PASSTHROUGH` | 设为 `off` 可关闭对历史 assistant 消息的推理字段改写（`reasoning_content` 占位与 `reasoning` 补齐） |
 | `CB_GATEWAY_DEFAULT_REASONING_EFFORT` | WorkBuddy DeepSeek V4 Pro/Flash 的默认思考强度，支持 `low` / `high` / `max`，默认 `high`；设为 `off` 可关闭默认值。Responses 的 `reasoning.effort` 或 Chat Completions 的 `reasoning_effort` 会覆盖它 |
+| `CB_GATEWAY_UPSTREAM_PROXY` | 出站代理地址。不设时：国际版账号走系统代理，国内站账号直连优先、仅在**直连建连失败**时用代理兜底重发一次 |
+| `CB_GATEWAY_INTL_PROXY` | 设为 `off` 可关掉「国际版账号一律走代理」，退回原来的直连优先 |
+| `CB_GATEWAY_WB_AT_REST_KEY` | WorkBuddy AI 桌面端 `$wbEncrypted` 信封的 atRestSecretKey。不设时从运行中的客户端自动取（需客户端开着） |
 | `CB_AUTH_DIR` | WorkBuddy 登录目录 |
 | `CB_QCLAW_AUTH_DIR` | QClaw 登录目录 |
 | `CB_QWENWORK_AUTH_DIR` | QwenWork 登录目录 |
@@ -316,6 +349,7 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 ## 数据和安全
 
 - 账号 Token 写入前会加密。Windows 用系统 DPAPI。
+- WorkBuddy AI 桌面端的 `$wbEncrypted` 信封解密后得到的是**明文 Token**，与直接读 auth 文件同等敏感；密钥（`CB_GATEWAY_WB_AT_REST_KEY`）等同于那份 Token 的读权限，别外传。
 - 不要把 `*.db`、登录目录、日志、带 Key 的截图发出去。
 - 不要把服务绑到公网。保持 `127.0.0.1`。
 

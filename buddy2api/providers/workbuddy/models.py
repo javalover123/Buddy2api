@@ -12,6 +12,7 @@ import re
 import httpx
 
 import buddy2api.auth_manager as auth_manager
+from buddy2api.upstream_transport import transport_for
 from buddy2api.model_capacity import capacity_fields
 from buddy2api.model_reasoning import reasoning_fields
 
@@ -99,7 +100,7 @@ async def fetch_supplier_models(account: dict) -> list[dict]:
     headers.pop("Content-Type", None)
     headers["Accept"] = "application/json"
     url = f"{auth_manager.backend_url_for(account)}{MODELS_PATH}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, transport=transport_for(account)) as client:
         response = await client.get(url, headers=headers)
     if response.status_code >= 400:
         raise WorkBuddyModelsError(f"models HTTP {response.status_code}")

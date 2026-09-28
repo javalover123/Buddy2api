@@ -41,6 +41,20 @@ python -m buddy2api
 
 Narrow with `CB_GATEWAY_PROVIDERS=workbuddy` if you only want one.
 
+### Encrypted credentials from the WorkBuddy AI desktop app
+
+Since WorkBuddy AI desktop 5.6.2, `accessToken` / `refreshToken` in the auth file are no longer plaintext but a `{"$wbEncrypted": 1, "envelope": "…"}` envelope (AES-256-GCM). The key lives only on the client side, so older gateways could not read it and **no international account could be imported at all** (the domestic `workbuddy-desktop.info` is still plaintext and was unaffected).
+
+The gateway now decrypts these itself: the key is read from the running client (the native `workbuddyStorage.loggerGet()` binding), so **keep the WorkBuddy AI client open before importing** and decryption happens automatically. The key derivation and AAD assembly live in `buddy2api/wb_at_rest.py` (the derived key is checked against the `keyId` the envelope declares, so a wrong key fails loudly instead of producing garbage).
+
+If you would rather not keep the client open, provide the key directly (same key, either source works):
+
+```bash
+export CB_GATEWAY_WB_AT_REST_KEY='<44-character canonical base64>'
+```
+
+When the key is unavailable or decryption fails, the import is skipped as "no credentials" and the Accounts page explains why — existing tokens in the database are never overwritten. The alternative is "seamless login", which returns plaintext credentials (the official OAuth endpoints are unaffected by the envelope).
+
 ## Before you start
 
 1. **An empty Accounts page after startup is expected.** 2.0 does not import on boot. Pick a channel → Detect → Import. All four channels are in the dropdown.
@@ -142,6 +156,22 @@ The expiry data comes from the local cache written by **Refresh official quota**
 This is a pure preference: if the preferred side has no usable account, or all of its accounts have been tried, the request falls back to the other side rather than failing.
 
 Each account name on the Accounts page shows its site underneath (`国际版 · www.workbuddy.ai` / `国内版 · www.codebuddy.cn`); detection is by domain suffix only.
+
+### The international site keeps returning 502 (ConnectTimeout)
+
+The symptom is bursts of `502` with `[upstream_disconnect] ConnectTimeout`, and **only international-site accounts are hit** while domestic-site accounts keep working at the same moment. This is not an invalid account and not an upstream ban: once the failure window passes, the same account on the same model recovers on its own.
+
+The cause is that **TCP connects from this machine to the international site's IP are intermittently black-holed** (measured: 60 consecutive SYNs all timed out, a direct `curl` returned `000`, while DNS was fine, the domestic site sat at p50 0.02s and github was normal). Opening the WorkBuddy client by hand goes through the system proxy, which is why "the client works but the gateway does not".
+
+The gateway routes international-site accounts through a proxy by default (see "The international site keeps returning 502"), so it does not land on that broken path. Proxy candidates, in order:
+
+1. `CB_GATEWAY_UPSTREAM_PROXY` (explicit);
+2. `CODEBUDDY_SERVICE_PROXY_URL` (the service proxy the WorkBuddy desktop app writes itself);
+3. the system proxy (macOS `scutil --proxy`; tools like Clash write it there).
+
+With none of the three available behaviour is exactly as before (direct connect). Domestic-site accounts are unchanged: they still **prefer a direct connect** and only fall back to re-sending the same request through a proxy when a direct connect fails. The fallback only covers the **connect** stage: once upstream has responded the request is never re-sent (streamed output may already have reached the client, and re-sending would re-run tool calls). Each trigger logs one line to `stderr` (at most one per minute, so a failure window does not flood the log).
+
+Set `CB_GATEWAY_INTL_PROXY=off` to disable forcing international accounts through the proxy and go back to direct-connect-first.
 
 ## Upgrade from 1.4.x
 
@@ -266,11 +296,13 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## Environment
 
-`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_GATEWAY_ROUTE_WINDOW_SECONDS` (default `900`, the load-averaging window used for account selection), `CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS` (default `900`, how long an account is skipped for a model after a 429; tracked per account+model), `CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS` (default `8`, how many accounts a single request may fail over through), `CB_GATEWAY_REASONING_PASSTHROUGH` (set `off` to disable the historical-assistant reasoning field rewrites), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_TRAEWORK_OS_INFO` (the `OSInfo` reported on TraeWork refresh; Windows `windows`, macOS `mac`, Linux `linux`), `CB_TRAEWORK_DEVICE_NAME`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
+`CB_GATEWAY_PROVIDERS` (default `workbuddy,qclaw,qwenwork,traework`), `CB_GATEWAY_AUTO_IMPORT` (default `0`), `CB_GATEWAY_ROUTE_WINDOW_SECONDS` (default `900`, the load-averaging window used for account selection), `CB_GATEWAY_RATE_LIMIT_COOLDOWN_SECONDS` (default `900`, how long an account is skipped for a model after a 429; tracked per account+model), `CB_GATEWAY_MAX_ACCOUNT_ATTEMPTS` (default `8`, how many accounts a single request may fail over through), `CB_GATEWAY_REASONING_PASSTHROUGH` (set `off` to disable the historical-assistant reasoning field rewrites), `CB_GATEWAY_UPSTREAM_PROXY` (outbound proxy address; when unset, international accounts go through the system proxy while domestic accounts prefer a direct connect and only fall back to a proxy on a failed direct connect), `CB_GATEWAY_INTL_PROXY` (set `off` to stop forcing international accounts through the proxy), `CB_GATEWAY_WB_AT_REST_KEY` (the atRestSecretKey for WorkBuddy AI desktop `$wbEncrypted` envelopes; when unset it is read from the running client, which must therefore be open), `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR` / `CB_TRAEWORK_AUTH_DIR`, `CB_TRAEWORK_OS_INFO` (the `OSInfo` reported on TraeWork refresh; Windows `windows`, macOS `mac`, Linux `linux`), `CB_TRAEWORK_DEVICE_NAME`, `CB_GATEWAY_ADMIN_TOKEN`, `CB_GATEWAY_MASTER_KEY`.
 
 `CB_GATEWAY_DEFAULT_REASONING_EFFORT` controls the default reasoning effort for WorkBuddy DeepSeek V4 Pro/Flash. It accepts `low`, `high`, or `max`, defaults to `high`, and can be disabled with `off`. A Responses `reasoning.effort` or Chat Completions `reasoning_effort` value overrides the default.
 
 Keep `--host 127.0.0.1`. Do not share the database, auth folders, or key screenshots.
+
+Decrypting a WorkBuddy AI desktop `$wbEncrypted` envelope yields the **plaintext token**, exactly as sensitive as reading the auth file directly; the key (`CB_GATEWAY_WB_AT_REST_KEY`) grants the same read access. Do not share it.
 
 ## License
 
