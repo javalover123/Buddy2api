@@ -464,6 +464,44 @@ def _ensure_reasoning_content_on_assistant_messages(messages, thinking_enabled: 
 _REASONING_FIELD_PLACEHOLDER = " "
 
 
+# 上游对 assistant(tool_calls) → tool 的配对是硬校验：一条 tool 消息的 tool_call_id
+# 必须紧跟在声明了它的那条 assistant 之后，否则整请求 400 code 11133
+# （extError.code=model_param_invalid，实测 2026-09-30）。
+# 客户端的会话历史被压缩/裁剪后，会留下「没有任何 assistant 声明过」的孤儿 tool 消息
+# （pi 的长会话实测 1089 条消息里 97 条孤儿），这类消息对上游无意义，直接丢弃。
+# 不做「补一条 assistant」的修复：没有真实的 tool_call 参数，补出来的调用会污染上下文。
+def _drop_orphan_tool_messages(messages):
+    """丢弃没有对应 assistant tool_calls 的 tool 消息。"""
+    if not isinstance(messages, list) or not messages:
+        return messages
+    pending: set = set()
+    cleaned: list = []
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict):
+            cleaned.append(message)
+            continue
+        role = message.get("role")
+        if role == "assistant":
+            # 新的 assistant 覆盖上一轮的待配对集合：更早未配对的 tool 消息已成为孤儿。
+            pending = {
+                tool_call.get("id")
+                for tool_call in (message.get("tool_calls") or [])
+                if isinstance(tool_call, dict) and tool_call.get("id")
+            }
+            cleaned.append(message)
+        elif role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if tool_call_id in pending:
+                pending.discard(tool_call_id)
+                cleaned.append(message)
+            else:
+                changed = True
+        else:
+            cleaned.append(message)
+    return cleaned if changed else messages
+
+
 def _ensure_reasoning_field_for_continuation(messages, thinking_enabled: bool, has_tools: bool):
     """给「最后一条 user 之后的首条纯文本 assistant 消息」补上非空 reasoning。
 
@@ -520,6 +558,9 @@ def build_backend_body(payload: dict) -> dict:
         ]
         # 角色归一化之后再补 system，避免 developer 被映射成 system 时重复插入
         body["messages"] = _ensure_leading_system_message(body["messages"])
+        # 必须在补 reasoning_content / reasoning 之前：孤儿 tool 消息先清掉，
+        # 否则后面的补齐逻辑会对着无效历史做判断。
+        body["messages"] = _drop_orphan_tool_messages(body["messages"])
     # Resolve model alias before forwarding
     raw_model = body.get("model", "auto")
     body["model"] = resolve_model_alias(raw_model)
